@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  ArrowLeft,
   ArrowRight,
   Box,
   ChevronDown,

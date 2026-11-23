@@ -63,6 +63,76 @@ class MysqlClient implements DbClient {
     if (fs.existsSync(migrationsFolder)) {
       await migrate(orm, { migrationsFolder });
     }
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS verification_codes (
+        id VARCHAR(64) PRIMARY KEY,
+        user_id VARCHAR(64) NOT NULL,
+        channel VARCHAR(16) NOT NULL,
+        target VARCHAR(190) NOT NULL,
+        purpose VARCHAR(32) NOT NULL DEFAULT 'verify_contact',
+        code_hash VARCHAR(128) NOT NULL,
+        attempts INT NOT NULL DEFAULT 0,
+        expires_at TIMESTAMP NOT NULL,
+        consumed_at TIMESTAMP NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_verif_user_channel (user_id, channel)
+      )
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS chat_conversations (
+        id VARCHAR(64) PRIMARY KEY,
+        seller_id VARCHAR(64) NOT NULL,
+        customer_user_id VARCHAR(64) NOT NULL,
+        customer_name VARCHAR(160) NOT NULL,
+        product_id VARCHAR(64) NULL,
+        status VARCHAR(24) NOT NULL DEFAULT 'open',
+        unread_for_seller INT NOT NULL DEFAULT 0,
+        unread_for_customer INT NOT NULL DEFAULT 0,
+        last_message_preview VARCHAR(240) NULL,
+        last_message_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_chat_conv_seller (seller_id),
+        INDEX idx_chat_conv_customer (customer_user_id)
+      )
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id VARCHAR(64) PRIMARY KEY,
+        conversation_id VARCHAR(64) NOT NULL,
+        sender_role VARCHAR(24) NOT NULL,
+        sender_user_id VARCHAR(64) NOT NULL,
+        body TEXT NOT NULL,
+        read_at TIMESTAMP NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_chat_msg_conv (conversation_id)
+      )
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS notification_preferences (
+        user_id VARCHAR(64) PRIMARY KEY,
+        email_summary_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        summary_frequency VARCHAR(16) NOT NULL DEFAULT 'daily',
+        order_updates BOOLEAN NOT NULL DEFAULT TRUE,
+        price_drops BOOLEAN NOT NULL DEFAULT TRUE,
+        promotional_offers BOOLEAN NOT NULL DEFAULT TRUE,
+        last_summary_sent_at TIMESTAMP NULL,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    const ensureMysqlCol = async (table: string, col: string, defSql: string) => {
+      const [rows] = await this.pool.execute(
+        `SELECT COUNT(*) AS cnt FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+        [table, col]
+      );
+      const list = rows as Array<{ cnt: number }>;
+      if (!list[0] || Number(list[0].cnt) === 0) {
+        await this.pool.execute(`ALTER TABLE ${table} ADD COLUMN ${col} ${defSql}`);
+      }
+    };
+    await ensureMysqlCol('notifications', 'category', "VARCHAR(32) NOT NULL DEFAULT 'system'");
+    await ensureMysqlCol('notifications', 'action_url', 'VARCHAR(255) NULL');
+    await ensureMysqlCol('notifications', 'metadata_json', 'JSON NULL');
+    await ensureMysqlCol('notifications', 'emailed_at', 'TIMESTAMP NULL');
   }
 
   async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
@@ -454,6 +524,38 @@ class SqlitePreviewClient implements DbClient {
         recipient_email TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')),
         UNIQUE(flow_id, dedup_key)
       );
+      CREATE TABLE IF NOT EXISTS verification_codes (
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL, channel TEXT NOT NULL,
+        target TEXT NOT NULL, purpose TEXT NOT NULL DEFAULT 'verify_contact',
+        code_hash TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+        expires_at TEXT NOT NULL, consumed_at TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_verif_user_channel ON verification_codes(user_id, channel);
+      CREATE TABLE IF NOT EXISTS chat_conversations (
+        id TEXT PRIMARY KEY, seller_id TEXT NOT NULL, customer_user_id TEXT NOT NULL,
+        customer_name TEXT NOT NULL, product_id TEXT, status TEXT NOT NULL DEFAULT 'open',
+        unread_for_seller INTEGER NOT NULL DEFAULT 0, unread_for_customer INTEGER NOT NULL DEFAULT 0,
+        last_message_preview TEXT, last_message_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_chat_conv_seller ON chat_conversations(seller_id);
+      CREATE INDEX IF NOT EXISTS idx_chat_conv_customer ON chat_conversations(customer_user_id);
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, sender_role TEXT NOT NULL,
+        sender_user_id TEXT NOT NULL, body TEXT NOT NULL, read_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_chat_msg_conv ON chat_messages(conversation_id);
+      CREATE TABLE IF NOT EXISTS notification_preferences (
+        user_id TEXT PRIMARY KEY,
+        email_summary_enabled INTEGER NOT NULL DEFAULT 1,
+        summary_frequency TEXT NOT NULL DEFAULT 'daily',
+        order_updates INTEGER NOT NULL DEFAULT 1,
+        price_drops INTEGER NOT NULL DEFAULT 1,
+        promotional_offers INTEGER NOT NULL DEFAULT 1,
+        last_summary_sent_at TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
     `);
 
     const ensureCol = (table: string, col: string, defSql: string) => {
@@ -492,6 +594,10 @@ class SqlitePreviewClient implements DbClient {
     ensureCol('offers', 'priority', 'INTEGER NOT NULL DEFAULT 10');
     ensureCol('offers', 'rules_json', 'TEXT');
     ensureCol('stores', 'locations_json', 'TEXT');
+    ensureCol('notifications', 'category', "TEXT NOT NULL DEFAULT 'system'");
+    ensureCol('notifications', 'action_url', 'TEXT');
+    ensureCol('notifications', 'metadata_json', 'TEXT');
+    ensureCol('notifications', 'emailed_at', 'TEXT');
   }
 
   private getDb() {

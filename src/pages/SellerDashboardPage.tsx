@@ -1,6 +1,8 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { Download, Edit3, Printer, ShieldCheck, Trash2, Upload } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { Download, Edit3, MessageSquare, Printer, Send, ShieldCheck, Sparkles, Trash2, Upload } from 'lucide-react';
 import type {
+  ChatConversation,
+  ChatMessage,
   Coupon,
   DeliveryZone,
   LedgerEntry,
@@ -10,6 +12,7 @@ import type {
   Product,
   Review,
   Seller,
+  SellerCommunicationPrefs,
   SellerPromoRules,
   StorefrontThemeId,
   StoreLocation,
@@ -20,9 +23,14 @@ import type {
 import { APPROVED_STOREFRONT_THEMES } from '../shared/themes.ts';
 import { LEBANON_GOVERNORATES } from '../shared/lebanon.ts';
 import { formatBpsAsPercent } from '../shared/money.ts';
+import {
+  DEFAULT_SELLER_COMMUNICATION_PREFS,
+  evaluateBusinessSetupReadiness,
+} from '../shared/communication.ts';
 import { useMarketplace } from '../context/MarketplaceContext.tsx';
 import { EmptyState, PriceDisplay, SectionHeading, StampBadge, StatusLabel } from '../components/HairlineUI.tsx';
 import { StoreLocationManager } from '../components/maps/StoreLocationManager.tsx';
+import { BusinessSetupWizard, type BusinessSetupFormValues } from '../components/seller/BusinessSetupWizard.tsx';
 import { useSeoMetadata } from '../utils/seo.ts';
 
 interface SellerSubOrderView extends SubOrder {
@@ -87,7 +95,9 @@ export function SellerDashboardPage() {
   });
 
   const [workspace, setWorkspace] = useState<WorkspacePayload | null>(null);
-  const [tab, setTab] = useState<'overview' | 'products' | 'orders' | 'storefront' | 'coupons'>('overview');
+  const [tab, setTab] = useState<
+    'overview' | 'setup' | 'products' | 'orders' | 'storefront' | 'messages' | 'coupons'
+  >('overview');
   const [loading, setLoading] = useState(false);
 
   // Seller Sign-In state
@@ -141,6 +151,11 @@ export function SellerDashboardPage() {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   // Storefront edit state
+  const [storeNameEn, setStoreNameEn] = useState('');
+  const [storeNameAr, setStoreNameAr] = useState('');
+  const [storePhone, setStorePhone] = useState('');
+  const [cityAddress, setCityAddress] = useState('');
+  const [workingHoursSchedule, setWorkingHoursSchedule] = useState('');
   const [taglineEn, setTaglineEn] = useState('');
   const [taglineAr, setTaglineAr] = useState('');
   const [aboutEn, setAboutEn] = useState('');
@@ -152,9 +167,19 @@ export function SellerDashboardPage() {
   const [processingHours, setProcessingHours] = useState('24');
   const [vacationMode, setVacationMode] = useState(false);
   const [whatsappPhone, setWhatsappPhone] = useState('');
+  const [communicationPrefs, setCommunicationPrefs] = useState<SellerCommunicationPrefs>(
+    DEFAULT_SELLER_COMMUNICATION_PREFS
+  );
   const [themeId, setThemeId] = useState<StorefrontThemeId>('obsidian-ember');
   const [deliveryMode, setDeliveryMode] = useState<'platform' | 'self'>('platform');
   const [storeLocations, setStoreLocations] = useState<StoreLocation[]>([]);
+
+  // Seller customer chat state
+  const [conversations, setConversations] = useState<ChatConversation[]>([]);
+  const [activeConvId, setActiveConvId] = useState<string | null>(null);
+  const [convMessages, setConvMessages] = useState<ChatMessage[]>([]);
+  const [chatReplyDraft, setChatReplyDraft] = useState('');
+  const [chatBusy, setChatBusy] = useState(false);
 
   const isSellerAccount = authUser && (authUser.roleKey === 'seller_owner' || authUser.roleKey === 'seller_staff');
 
@@ -164,6 +189,15 @@ export function SellerDashboardPage() {
     try {
       const data = await apiFetch<WorkspacePayload>('/api/seller/workspace');
       setWorkspace(data);
+      setStoreNameEn(data.seller.name.en || '');
+      setStoreNameAr(data.seller.name.ar || '');
+      setStorePhone(data.seller.phone || '');
+      setCityAddress(data.seller.cityAddress || '');
+      setWorkingHoursSchedule(
+        data.seller.workingHours?.schedule ||
+          Object.values(data.seller.workingHours || {})[0] ||
+          'Mon–Sat 09:00–19:00'
+      );
       setTaglineEn(data.seller.tagline.en);
       setTaglineAr(data.seller.tagline.ar || '');
       setAboutEn(data.seller.about.en);
@@ -175,9 +209,23 @@ export function SellerDashboardPage() {
       setProcessingHours(String(data.seller.processingHours || 24));
       setVacationMode(Boolean(data.seller.vacationMode));
       setWhatsappPhone(data.seller.whatsappPhone || '');
+      setCommunicationPrefs({
+        ...DEFAULT_SELLER_COMMUNICATION_PREFS,
+        ...(data.seller.communicationPrefs || {}),
+      });
       setThemeId(data.seller.storefrontTheme);
       setDeliveryMode(data.seller.deliveryMode);
       setStoreLocations(data.seller.locations || []);
+
+      try {
+        const chatRes = await apiFetch<{ conversations: ChatConversation[] }>(
+          `/api/chat/conversations?sellerId=${encodeURIComponent(data.seller.id)}`
+        );
+        setConversations(chatRes.conversations || []);
+        setActiveConvId((prev) => prev || chatRes.conversations?.[0]?.id || null);
+      } catch {
+        // ignore transient chat error
+      }
     } catch (err) {
       showToast((err as Error).message, 'error');
     } finally {
@@ -189,13 +237,39 @@ export function SellerDashboardPage() {
     void loadWorkspace();
   }, [loadWorkspace]);
 
+  const loadChatMessages = useCallback(async () => {
+    if (!isSellerAccount || !activeConvId) return;
+    try {
+      const res = await apiFetch<{ conversation: ChatConversation; messages: ChatMessage[] }>(
+        `/api/chat/conversations/${encodeURIComponent(activeConvId)}/messages`
+      );
+      setConvMessages(res.messages || []);
+    } catch {
+      // ignore transient
+    }
+  }, [isSellerAccount, activeConvId, apiFetch]);
+
+  useEffect(() => {
+    if (tab !== 'messages' || !activeConvId) return;
+    void loadChatMessages();
+    const timer = setInterval(() => {
+      void loadChatMessages();
+    }, 6000);
+    return () => clearInterval(timer);
+  }, [tab, activeConvId, loadChatMessages]);
+
+  const totalUnreadMessages = useMemo(
+    () => conversations.reduce((sum, c) => sum + (c.unreadForSeller || 0), 0),
+    [conversations]
+  );
+
   const handleSellerLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
       await apiFetch('/api/auth/login', {
         method: 'POST',
         body: JSON.stringify({
-          email: loginEmail,
+          identifier: loginEmail.trim(),
           password: loginPassword,
           totpCode: loginTotp.trim() || undefined,
         }),
@@ -236,7 +310,7 @@ export function SellerDashboardPage() {
 
   const handleMediaUpload = async (
     file: File,
-    entityType: 'product_image' | 'seller_document' | 'store_banner'
+    entityType: 'product_image' | 'seller_document' | 'store_banner' | 'store_logo'
   ) => {
     setUploadingMedia(true);
     try {
@@ -257,10 +331,16 @@ export function SellerDashboardPage() {
           method: 'PATCH',
           body: JSON.stringify({ bannerMediaId: res.media.mediaId }),
         });
+      } else if (entityType === 'store_logo') {
+        await apiFetch('/api/seller/profile', {
+          method: 'PATCH',
+          body: JSON.stringify({ logoMediaId: res.media.mediaId }),
+        });
       }
       showToast('File validated and uploaded securely', 'success');
       if (entityType !== 'product_image') {
         await loadWorkspace();
+        await refreshBootstrap();
       }
     } catch (err) {
       showToast((err as Error).message, 'error');
@@ -285,10 +365,10 @@ export function SellerDashboardPage() {
             </p>
             <input
               required
-              type="email"
+              type="text"
               value={loginEmail}
               onChange={(e) => setLoginEmail(e.target.value)}
-              placeholder="Merchant Email"
+              placeholder="Merchant Email or Phone (+961)"
               className="w-full bg-[var(--ink)] border border-[var(--line)] px-3 py-2.5 text-sm text-[var(--bone)]"
             />
             <input
@@ -494,12 +574,16 @@ export function SellerDashboardPage() {
     }
   };
 
-  const handleSaveStorefront = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const saveBusinessProfile = async () => {
     try {
       await apiFetch('/api/seller/profile', {
         method: 'PATCH',
         body: JSON.stringify({
+          nameEn: storeNameEn.trim().length >= 2 ? storeNameEn.trim() : undefined,
+          nameAr: storeNameAr.trim().length >= 2 ? storeNameAr.trim() : undefined,
+          phone: storePhone.trim().length >= 6 ? storePhone.trim() : undefined,
+          cityAddress: cityAddress.trim() || undefined,
+          workingHours: workingHoursSchedule.trim() ? { schedule: workingHoursSchedule.trim() } : undefined,
           taglineEn,
           taglineAr,
           aboutEn,
@@ -510,18 +594,70 @@ export function SellerDashboardPage() {
           returnPolicyAr,
           processingHours: Number(processingHours || 24),
           vacationMode,
-          whatsappPhone: whatsappPhone.trim() || undefined,
+          whatsappPhone: whatsappPhone.trim().length >= 6 ? whatsappPhone.trim() : undefined,
+          communicationPrefs,
           storefrontTheme: themeId,
           deliveryMode,
           locations: storeLocations,
         }),
       });
-      showToast('Storefront, locations & delivery settings saved', 'success');
+      showToast('Storefront, logo/cover, communication & branch locations saved', 'success');
       await loadWorkspace();
       await refreshBootstrap();
     } catch (err) {
       showToast((err as Error).message, 'error');
     }
+  };
+
+  const handleSaveStorefront = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await saveBusinessProfile();
+  };
+
+  const wizardFormValues: BusinessSetupFormValues = {
+    nameEn: storeNameEn,
+    nameAr: storeNameAr,
+    taglineEn,
+    taglineAr,
+    aboutEn,
+    aboutAr,
+    storePhone,
+    cityAddress,
+    workingHoursSchedule,
+    announcementEn,
+    announcementAr,
+    returnPolicyEn,
+    returnPolicyAr,
+    processingHours,
+    vacationMode,
+    whatsappPhone,
+    communicationPrefs,
+    themeId,
+    deliveryMode,
+    storeLocations,
+  };
+
+  const handleWizardPatch = (patch: Partial<BusinessSetupFormValues>) => {
+    if (patch.nameEn !== undefined) setStoreNameEn(patch.nameEn);
+    if (patch.nameAr !== undefined) setStoreNameAr(patch.nameAr);
+    if (patch.taglineEn !== undefined) setTaglineEn(patch.taglineEn);
+    if (patch.taglineAr !== undefined) setTaglineAr(patch.taglineAr);
+    if (patch.aboutEn !== undefined) setAboutEn(patch.aboutEn);
+    if (patch.aboutAr !== undefined) setAboutAr(patch.aboutAr);
+    if (patch.storePhone !== undefined) setStorePhone(patch.storePhone);
+    if (patch.cityAddress !== undefined) setCityAddress(patch.cityAddress);
+    if (patch.workingHoursSchedule !== undefined) setWorkingHoursSchedule(patch.workingHoursSchedule);
+    if (patch.announcementEn !== undefined) setAnnouncementEn(patch.announcementEn);
+    if (patch.announcementAr !== undefined) setAnnouncementAr(patch.announcementAr);
+    if (patch.returnPolicyEn !== undefined) setReturnPolicyEn(patch.returnPolicyEn);
+    if (patch.returnPolicyAr !== undefined) setReturnPolicyAr(patch.returnPolicyAr);
+    if (patch.processingHours !== undefined) setProcessingHours(patch.processingHours);
+    if (patch.vacationMode !== undefined) setVacationMode(patch.vacationMode);
+    if (patch.whatsappPhone !== undefined) setWhatsappPhone(patch.whatsappPhone);
+    if (patch.communicationPrefs !== undefined) setCommunicationPrefs(patch.communicationPrefs);
+    if (patch.themeId !== undefined) setThemeId(patch.themeId);
+    if (patch.deliveryMode !== undefined) setDeliveryMode(patch.deliveryMode);
+    if (patch.storeLocations !== undefined) setStoreLocations(patch.storeLocations);
   };
 
   const handleExportProductsCsv = () => {
@@ -571,9 +707,14 @@ export function SellerDashboardPage() {
       <div className="flex flex-wrap gap-2">
         {[
           { id: 'overview' as const, label: 'Earnings, KYC & Ledger' },
+          { id: 'setup' as const, label: 'Business Setup' },
           { id: 'products' as const, label: `Products (${products.length})` },
           { id: 'orders' as const, label: `Sub-Orders (${subOrders.length})` },
-          { id: 'storefront' as const, label: 'Storefront & Delivery' },
+          { id: 'storefront' as const, label: 'Storefront, Logo & Delivery' },
+          {
+            id: 'messages' as const,
+            label: `Customer Chat (${conversations.length}${totalUnreadMessages > 0 ? ` · ${totalUnreadMessages} new` : ''})`,
+          },
           { id: 'coupons' as const, label: 'Coupons, Offers & Reviews' },
         ].map((item) => (
           <button
@@ -593,6 +734,40 @@ export function SellerDashboardPage() {
 
       {tab === 'overview' && (
         <div className="space-y-6">
+          {(() => {
+            const readiness = evaluateBusinessSetupReadiness({
+              seller,
+              nameEn: storeNameEn,
+              nameAr: storeNameAr,
+              taglineEn,
+              aboutEn,
+              whatsappPhone,
+              locations: storeLocations,
+              returnPolicyEn,
+            });
+            return (
+              <div className="border border-[var(--line)] bg-[var(--graphite)] p-4 flex flex-wrap items-center justify-between gap-4">
+                <div className="space-y-1">
+                  <p className="text-xs font-mono-tabular uppercase text-[var(--ember)] inline-flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>
+                      Business Setup Progress: {readiness.completedCount}/{readiness.totalCount} ({readiness.percent}%)
+                    </span>
+                  </p>
+                  <p className="text-xs text-[var(--muted)]">
+                    Configure your store logo, custom cover banner, WhatsApp Business link, and branch locations in the guided wizard.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setTab('setup')}
+                  className="px-4 py-2 bg-[var(--ember)] text-[var(--ember-fg)] text-xs font-bold uppercase whitespace-nowrap cursor-pointer"
+                >
+                  Open Business Setup Wizard
+                </button>
+              </div>
+            );
+          })()}
           <div className="hairline-grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4">
             <div className="hairline-cell p-5">
               <p className="text-xs font-mono-tabular text-[var(--muted)] uppercase">Available Balance</p>
@@ -1043,10 +1218,69 @@ export function SellerDashboardPage() {
         </div>
       )}
 
+      {tab === 'setup' && (
+        <BusinessSetupWizard
+          seller={seller}
+          locale={locale}
+          uploadingMedia={uploadingMedia}
+          values={wizardFormValues}
+          onChange={handleWizardPatch}
+          onUploadMedia={async (file, entityType) => {
+            await handleMediaUpload(file, entityType);
+          }}
+          onSaveSetup={saveBusinessProfile}
+          onOpenStorefront={() => navigate(`/store/${seller.slug}`)}
+        />
+      )}
+
       {tab === 'storefront' && (
         <form onSubmit={handleSaveStorefront} className="border border-[var(--line)] bg-[var(--graphite)] p-6 space-y-6">
-          <h2 className="font-display text-xl font-bold text-[var(--bone)]">Branded Storefront, Locations & Logistics</h2>
+          <h2 className="font-display text-xl font-bold text-[var(--bone)]">Branded Storefront, Logo, Locations &amp; Logistics</h2>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <label className="block space-y-1 text-xs">
+              <span className="font-mono-tabular uppercase text-[var(--muted)]">Store Name (EN)</span>
+              <input
+                value={storeNameEn}
+                onChange={(e) => setStoreNameEn(e.target.value)}
+                className="w-full bg-[var(--ink)] border border-[var(--line)] px-3 py-2 text-sm text-[var(--bone)]"
+              />
+            </label>
+            <label className="block space-y-1 text-xs">
+              <span className="font-mono-tabular uppercase text-[var(--muted)]">اسم المتجر (AR)</span>
+              <input
+                dir="rtl"
+                value={storeNameAr}
+                onChange={(e) => setStoreNameAr(e.target.value)}
+                className="w-full bg-[var(--ink)] border border-[var(--line)] px-3 py-2 text-sm text-[var(--bone)]"
+              />
+            </label>
+            <label className="block space-y-1 text-xs">
+              <span className="font-mono-tabular uppercase text-[var(--muted)]">Business Phone</span>
+              <input
+                value={storePhone}
+                onChange={(e) => setStorePhone(e.target.value)}
+                placeholder="+9611..."
+                className="w-full bg-[var(--ink)] border border-[var(--line)] px-3 py-2 font-mono-tabular text-sm text-[var(--bone)]"
+              />
+            </label>
+            <label className="block space-y-1 text-xs">
+              <span className="font-mono-tabular uppercase text-[var(--muted)]">City / Street Address</span>
+              <input
+                value={cityAddress}
+                onChange={(e) => setCityAddress(e.target.value)}
+                placeholder="Hamra Main Street, Beirut"
+                className="w-full bg-[var(--ink)] border border-[var(--line)] px-3 py-2 text-sm text-[var(--bone)]"
+              />
+            </label>
+            <label className="block space-y-1 text-xs md:col-span-2">
+              <span className="font-mono-tabular uppercase text-[var(--muted)]">Working Hours</span>
+              <input
+                value={workingHoursSchedule}
+                onChange={(e) => setWorkingHoursSchedule(e.target.value)}
+                placeholder="Mon–Sat 09:00–19:00"
+                className="w-full bg-[var(--ink)] border border-[var(--line)] px-3 py-2 font-mono-tabular text-sm text-[var(--bone)]"
+              />
+            </label>
             <label className="block space-y-1 text-xs">
               <span className="font-mono-tabular uppercase text-[var(--muted)]">Store Tagline (EN)</span>
               <input
@@ -1155,20 +1389,66 @@ export function SellerDashboardPage() {
             </label>
           </div>
 
-          <div>
-            <label className="inline-flex items-center gap-2 px-3.5 py-2 border border-[var(--line)] text-xs text-[var(--bone)] cursor-pointer">
-              <Upload className="w-3.5 h-3.5" />
-              <span>Upload Storefront Banner Image</span>
-              <input
-                type="file"
-                accept="image/jpeg,image/png,image/webp"
-                className="hidden"
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) void handleMediaUpload(f, 'store_banner');
-                }}
-              />
-            </label>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 border border-[var(--line)] bg-[var(--ink)] p-4">
+            <div className="space-y-3">
+              <p className="text-xs font-mono-tabular uppercase text-[var(--muted)]">Store Logo (Square Avatar)</p>
+              <div className="flex items-center gap-4">
+                {seller.logoImage ? (
+                  <img
+                    src={seller.logoImage}
+                    alt={`${seller.name.en} logo`}
+                    className="w-16 h-16 object-cover border border-[var(--line)] bg-[var(--graphite)]"
+                  />
+                ) : (
+                  <div className="w-16 h-16 border border-dashed border-[var(--line)] flex items-center justify-center text-[11px] font-mono-tabular text-[var(--muted)]">
+                    No Logo
+                  </div>
+                )}
+                <label className="inline-flex items-center gap-2 px-3.5 py-2 border border-[var(--line)] text-xs text-[var(--bone)] hover:border-[var(--ember)] cursor-pointer">
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>{uploadingMedia ? 'Uploading...' : 'Upload Store Logo'}</span>
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) void handleMediaUpload(f, 'store_logo');
+                    }}
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <p className="text-xs font-mono-tabular uppercase text-[var(--muted)]">Storefront Cover Banner</p>
+              <div className="flex items-center gap-4">
+                {seller.bannerImage ? (
+                  <img
+                    src={seller.bannerImage}
+                    alt={`${seller.name.en} cover`}
+                    className="w-32 h-16 object-cover border border-[var(--line)] bg-[var(--graphite)]"
+                  />
+                ) : (
+                  <div className="w-32 h-16 border border-dashed border-[var(--line)] flex items-center justify-center text-[11px] font-mono-tabular text-[var(--muted)]">
+                    No Cover
+                  </div>
+                )}
+                <label className="inline-flex items-center gap-2 px-3.5 py-2 border border-[var(--line)] text-xs text-[var(--bone)] hover:border-[var(--ember)] cursor-pointer">
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>{uploadingMedia ? 'Uploading...' : 'Upload Cover Banner'}</span>
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) void handleMediaUpload(f, 'store_banner');
+                    }}
+                  />
+                </label>
+              </div>
+            </div>
           </div>
 
           <StoreLocationManager
@@ -1222,9 +1502,151 @@ export function SellerDashboardPage() {
             type="submit"
             className="px-6 py-2.5 bg-[var(--ember)] text-[var(--ember-fg)] text-xs font-bold uppercase cursor-pointer"
           >
-            Save Storefront & Branch Locations
+            Save Storefront, Logo &amp; Branch Locations
           </button>
         </form>
+      )}
+
+      {tab === 'messages' && (
+        <div className="hairline-grid grid-cols-1 lg:grid-cols-12">
+          <div className="hairline-cell lg:col-span-4 border-e border-[var(--line)] divide-y divide-[var(--line)] max-h-[540px] overflow-y-auto">
+            {conversations.length === 0 ? (
+              <div className="p-6">
+                <EmptyState
+                  title="No customer conversations yet"
+                  description="When buyers message your store from product listings or your storefront page, threads appear here."
+                />
+              </div>
+            ) : (
+              conversations.map((conv) => (
+                <button
+                  key={conv.id}
+                  type="button"
+                  onClick={() => setActiveConvId(conv.id)}
+                  className={`w-full p-4 text-start space-y-1 cursor-pointer ${
+                    activeConvId === conv.id ? 'bg-[var(--ink)] border-s-2 border-s-[var(--ember)]' : 'hover:bg-[var(--ink)]'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-sm text-[var(--bone)] truncate">{conv.customerName}</span>
+                    <div className="flex items-center gap-1.5">
+                      {conv.unreadForSeller > 0 && (
+                        <span className="px-1.5 py-0.5 bg-[var(--ember)] text-[var(--ember-fg)] text-[10px] font-mono-tabular font-bold">
+                          {conv.unreadForSeller}
+                        </span>
+                      )}
+                      <StatusLabel status={conv.status} tone={conv.status === 'open' ? 'cedar' : 'gold'} />
+                    </div>
+                  </div>
+                  {conv.productTitle && (
+                    <p className="text-[11px] font-mono-tabular text-[var(--cyan)] truncate">
+                      Re: {conv.productTitle[locale] || conv.productTitle.en}
+                    </p>
+                  )}
+                  <p className="text-xs text-[var(--muted)] truncate">{conv.lastMessagePreview || '—'}</p>
+                </button>
+              ))
+            )}
+          </div>
+
+          <div className="hairline-cell lg:col-span-8 flex flex-col min-h-[440px]">
+            {!activeConvId ? (
+              <div className="p-8 flex-1 flex items-center justify-center text-xs text-[var(--muted)]">
+                Select a customer thread to reply directly in System Chat.
+              </div>
+            ) : (
+              <>
+                {(() => {
+                  const activeConv = conversations.find((c) => c.id === activeConvId);
+                  if (!activeConv) return null;
+                  return (
+                    <div className="px-5 py-3 border-b border-[var(--line)] bg-[var(--graphite)] flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 text-xs">
+                        <MessageSquare className="w-4 h-4 text-[var(--ember)]" />
+                        <span className="font-bold text-[var(--bone)]">{activeConv.customerName}</span>
+                        <StatusLabel status={activeConv.status} tone={activeConv.status === 'open' ? 'cedar' : 'gold'} />
+                      </div>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const nextStatus = activeConv.status === 'open' ? 'closed' : 'open';
+                          await apiFetch(`/api/chat/conversations/${encodeURIComponent(activeConv.id)}`, {
+                            method: 'PATCH',
+                            body: JSON.stringify({ status: nextStatus }),
+                          });
+                          showToast(`Conversation ${nextStatus}`, 'info');
+                          await loadWorkspace();
+                        }}
+                        className="px-3 py-1 border border-[var(--line)] text-xs font-mono-tabular uppercase text-[var(--bone)] hover:border-[var(--ember)] cursor-pointer"
+                      >
+                        {activeConv.status === 'open' ? 'Close Thread' : 'Reopen Thread'}
+                      </button>
+                    </div>
+                  );
+                })()}
+
+                <div className="flex-1 overflow-y-auto p-5 space-y-3 bg-[var(--ink)] max-h-[380px]">
+                  {convMessages.map((m) => (
+                    <div
+                      key={m.id}
+                      className={`max-w-[82%] p-3 border text-xs space-y-1 ${
+                        m.senderRole === 'seller'
+                          ? 'ms-auto bg-[var(--graphite)] border-[var(--ember)]'
+                          : 'me-auto bg-[var(--graphite)] border-[var(--line)]'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-3 text-[10px] font-mono-tabular text-[var(--muted)]">
+                        <span>{m.senderName || (m.senderRole === 'seller' ? seller.name.en : 'Customer')}</span>
+                        <span>{new Date(m.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                      </div>
+                      <p className="text-sm text-[var(--bone)] whitespace-pre-wrap">{m.body}</p>
+                    </div>
+                  ))}
+                </div>
+
+                <form
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    if (!activeConvId || !chatReplyDraft.trim()) return;
+                    setChatBusy(true);
+                    try {
+                      const res = await apiFetch<{ message: ChatMessage }>(
+                        `/api/chat/conversations/${encodeURIComponent(activeConvId)}/messages`,
+                        {
+                          method: 'POST',
+                          body: JSON.stringify({ body: chatReplyDraft.trim() }),
+                        }
+                      );
+                      setConvMessages((prev) => [...prev, res.message]);
+                      setChatReplyDraft('');
+                      await loadChatMessages();
+                    } catch (err) {
+                      showToast((err as Error).message, 'error');
+                    } finally {
+                      setChatBusy(false);
+                    }
+                  }}
+                  className="p-4 border-t border-[var(--line)] bg-[var(--graphite)] flex gap-2"
+                >
+                  <input
+                    value={chatReplyDraft}
+                    onChange={(e) => setChatReplyDraft(e.target.value)}
+                    placeholder="Reply to customer..."
+                    className="flex-1 bg-[var(--ink)] border border-[var(--line)] px-3 py-2 text-xs text-[var(--bone)]"
+                  />
+                  <button
+                    type="submit"
+                    disabled={chatBusy || !chatReplyDraft.trim()}
+                    className="px-4 py-2 bg-[var(--ember)] text-[var(--ember-fg)] text-xs font-bold uppercase inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                    <span>Reply</span>
+                  </button>
+                </form>
+              </>
+            )}
+          </div>
+        </div>
       )}
 
       {tab === 'coupons' && (

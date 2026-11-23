@@ -1,9 +1,11 @@
 import React, { useEffect, useState } from 'react';
-import { Box, Heart, Image as ImageIcon, MapPin, MessageCircle, ShieldCheck, ZoomIn } from 'lucide-react';
+import { Box, Heart, Image as ImageIcon, MapPin, MessageCircle, MessageSquare, ShieldCheck, ZoomIn } from 'lucide-react';
 import type { Product, Review, Seller } from '../shared/types.ts';
 import { resolveUnitOfferPrice } from '../shared/offers.ts';
+import { buildWhatsAppBusinessLink } from '../shared/communication.ts';
 import { useMarketplace } from '../context/MarketplaceContext.tsx';
 import { Product3DShowcase } from '../components/Product3DShowcase.tsx';
+import { StoreChatModal } from '../components/StoreChatModal.tsx';
 import {
   EmptyState,
   PriceDisplay,
@@ -40,6 +42,7 @@ export function ProductDetailPage({ slug }: { slug: string }) {
   const [reviewRating, setReviewRating] = useState(5);
   const [reviewComment, setReviewComment] = useState('');
   const [submittingReview, setSubmittingReview] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -173,11 +176,17 @@ export function ProductDetailPage({ slug }: { slug: string }) {
     }
   };
 
+  const commPrefs = seller?.communicationPrefs;
+  const showWhatsApp = seller ? (commPrefs ? commPrefs.whatsappEnabled : Boolean(seller.whatsappPhone)) : false;
+  const showSystemChat = seller ? (commPrefs ? commPrefs.systemChatEnabled : true) : false;
   const whatsappUrl = seller
-    ? `https://wa.me/${seller.whatsappPhone}?text=${encodeURIComponent(
-        `Hello ${seller.name.en}, I have a question about ${product.title.en} (${activeVariant?.sku}) on NileLink.`
-      )}`
-    : '#';
+    ? buildWhatsAppBusinessLink({
+        phone: seller.whatsappPhone,
+        storeName: seller.name.en,
+        greeting: commPrefs?.whatsappGreeting,
+        productTitle: `${product.title.en}${activeVariant?.sku ? ` (${activeVariant.sku})` : ''}`,
+      })
+    : '';
 
   return (
     <div className="max-w-[1440px] mx-auto px-4 md:px-8 py-6 md:py-8 space-y-10 pb-24 md:pb-12">
@@ -380,18 +389,28 @@ export function ProductDetailPage({ slug }: { slug: string }) {
 
           {seller && (
             <div className="border border-[var(--line)] bg-[var(--ink)] p-4 space-y-3">
-              <div className="flex items-center justify-between gap-2">
-                <div>
-                  <p className="text-[11px] font-mono-tabular uppercase text-[var(--muted)]">
-                    {locale === 'ar' ? 'يباع ويُشحن بواسطة' : 'Sold & fulfilled by'}
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => navigate(`/store/${seller.slug}`)}
-                    className="editorial-link text-base font-semibold text-[var(--bone)] cursor-pointer"
-                  >
-                    {seller.name[locale]}
-                  </button>
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-3 min-w-0">
+                  {seller.logoImage && (
+                    <img
+                      src={seller.logoImage}
+                      alt={seller.name[locale]}
+                      referrerPolicy="no-referrer"
+                      className="w-10 h-10 object-cover border border-[var(--line)] shrink-0"
+                    />
+                  )}
+                  <div className="min-w-0">
+                    <p className="text-[11px] font-mono-tabular uppercase text-[var(--muted)]">
+                      {locale === 'ar' ? 'يباع ويُشحن بواسطة' : 'Sold & fulfilled by'}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => navigate(`/store/${seller.slug}`)}
+                      className="editorial-link text-base font-semibold text-[var(--bone)] truncate cursor-pointer"
+                    >
+                      {seller.name[locale]}
+                    </button>
+                  </div>
                 </div>
                 {seller.verified && <StampBadge label={t.verifiedSeller} tone="cedar" />}
               </div>
@@ -418,15 +437,29 @@ export function ProductDetailPage({ slug }: { slug: string }) {
                     </span>
                   </button>
                 )}
-                <a
-                  href={whatsappUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1.5 text-[var(--cedar)] hover:underline"
-                >
-                  <MessageCircle className="w-3.5 h-3.5" aria-hidden="true" />
-                  <span>{t.contactWhatsapp}</span>
-                </a>
+                <div className="flex items-center gap-2">
+                  {showSystemChat && (
+                    <button
+                      type="button"
+                      onClick={() => setChatOpen(true)}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 border border-[var(--ember)] text-[var(--ember)] font-semibold hover:bg-[var(--ember)] hover:text-[var(--ember-fg)] cursor-pointer"
+                    >
+                      <MessageSquare className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>{locale === 'ar' ? 'محادثة النظام' : 'System Chat'}</span>
+                    </button>
+                  )}
+                  {showWhatsApp && whatsappUrl && (
+                    <a
+                      href={whatsappUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 border border-[var(--line)] text-[var(--cedar)] hover:border-[var(--cedar)]"
+                    >
+                      <MessageCircle className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>{t.contactWhatsapp}</span>
+                    </a>
+                  )}
+                </div>
               </div>
             </div>
           )}
@@ -553,6 +586,14 @@ export function ProductDetailPage({ slug }: { slug: string }) {
           {t.addToCart}
         </button>
       </div>
+      {seller && (
+        <StoreChatModal
+          open={chatOpen}
+          onClose={() => setChatOpen(false)}
+          seller={seller}
+          product={product}
+        />
+      )}
     </div>
   );
 }

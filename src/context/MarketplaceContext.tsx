@@ -12,6 +12,7 @@ import type {
   Locale,
   MarketingPopup,
   NotificationItem,
+  NotificationPreferences,
   Offer,
   OfferBanner,
   PaymentConfig,
@@ -41,6 +42,9 @@ export interface AuthSessionUser {
   roleKey: UserRole;
   sellerId?: string;
   totpEnabled: boolean;
+  emailVerifiedAt?: string | null;
+  phoneVerifiedAt?: string | null;
+  isFullyVerified?: boolean;
   preferredLocale?: Locale;
   preferredCurrency?: Currency;
   permissions: string[];
@@ -92,11 +96,26 @@ interface MarketplaceContextValue {
   previewDrafts: boolean;
   setPreviewDrafts: (v: boolean) => void;
   loading: boolean;
+  authChecked: boolean;
   refreshBootstrap: () => Promise<void>;
   refreshFxRate: () => Promise<void>;
-  refreshAuth: () => Promise<void>;
+  refreshAuth: () => Promise<AuthSessionUser | null>;
   unreadNotificationsCount: number;
+  notifications: NotificationItem[];
+  notificationPrefs: NotificationPreferences;
   refreshNotifications: () => Promise<void>;
+  markNotificationRead: (idOrAll: string) => Promise<void>;
+  updateNotificationPreferences: (patch: Partial<NotificationPreferences>) => Promise<NotificationPreferences | null>;
+  sendNotificationEmailSummary: () => Promise<{
+    ok: boolean;
+    sentCount: number;
+    status: string;
+    error?: string | null;
+    previewSubject?: string;
+    lastSummarySentAt?: string | null;
+  } | null>;
+  isSearchOpen: boolean;
+  setIsSearchOpen: React.Dispatch<React.SetStateAction<boolean>>;
   cart: CartItem[];
   addToCart: (productId: string, variantId: string, quantity?: number) => void;
   updateCartQty: (productId: string, variantId: string, quantity: number) => void;
@@ -134,6 +153,15 @@ const DEFAULT_PAYMENTS: PaymentConfig = {
   whishInstructions: { en: '', ar: '' },
   cardEnabled: false,
   cardGatewayConfigured: false,
+};
+
+const DEFAULT_NOTIFICATION_PREFS: NotificationPreferences = {
+  emailSummaryEnabled: true,
+  summaryFrequency: 'daily',
+  orderUpdates: true,
+  priceDrops: true,
+  promotionalOffers: true,
+  lastSummarySentAt: null,
 };
 
 function readCookie(name: string): string {
@@ -191,7 +219,10 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
   const [offers, setOffers] = useState<Offer[]>([]);
   const [flashSales, setFlashSales] = useState<FlashSale[]>([]);
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const [notificationPrefs, setNotificationPrefs] = useState<NotificationPreferences>(DEFAULT_NOTIFICATION_PREFS);
   const [unreadNotificationsCount, setUnreadNotificationsCount] = useState(0);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [previewDrafts, setPreviewDrafts] = useState<boolean>(() => {
     const p = new URLSearchParams(window.location.search);
     return p.get('previewDrafts') === '1' || p.get('previewDrafts') === 'true';
@@ -218,6 +249,7 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
   });
 
   const [authUser, setAuthUser] = useState<AuthSessionUser | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
   const [toast, setToast] = useState<ToastMessage | null>(null);
   const [mapsApiKey, setMapsApiKey] = useState<string>(
     () => String(import.meta.env.VITE_GOOGLE_MAPS_API_KEY || '').trim()
@@ -391,14 +423,94 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
 
   const refreshNotifications = useCallback(async () => {
     try {
-      const data = await apiFetch<{ notifications: NotificationItem[] }>('/api/account/notifications');
-      setUnreadNotificationsCount((data.notifications || []).filter((n) => !n.readAt).length);
+      const data = await apiFetch<{
+        notifications: NotificationItem[];
+        unreadCount?: number;
+        preferences?: NotificationPreferences;
+      }>('/api/account/notifications');
+      const list = data.notifications || [];
+      setNotifications(list);
+      setUnreadNotificationsCount(
+        typeof data.unreadCount === 'number' ? data.unreadCount : list.filter((n) => !n.readAt).length
+      );
+      if (data.preferences) {
+        setNotificationPrefs(data.preferences);
+      }
     } catch {
+      setNotifications([]);
       setUnreadNotificationsCount(0);
     }
   }, [apiFetch]);
 
-  const refreshAuth = useCallback(async () => {
+  const markNotificationRead = useCallback(
+    async (idOrAll: string) => {
+      if (!authUser) return;
+      try {
+        await apiFetch(`/api/account/notifications/${encodeURIComponent(idOrAll)}/read`, { method: 'POST' });
+        await refreshNotifications();
+      } catch (err) {
+        showToast((err as Error).message, 'error');
+      }
+    },
+    [authUser, apiFetch, refreshNotifications, showToast]
+  );
+
+  const updateNotificationPreferences = useCallback(
+    async (patch: Partial<NotificationPreferences>): Promise<NotificationPreferences | null> => {
+      if (!authUser) return null;
+      try {
+        const res = await apiFetch<{ preferences: NotificationPreferences }>('/api/account/notifications/preferences', {
+          method: 'PATCH',
+          body: JSON.stringify(patch),
+        });
+        setNotificationPrefs(res.preferences);
+        showToast(locale === 'ar' ? 'تم حفظ تفضيلات الإشعارات' : 'Notification preferences saved', 'success');
+        return res.preferences;
+      } catch (err) {
+        showToast((err as Error).message, 'error');
+        return null;
+      }
+    },
+    [authUser, apiFetch, locale, showToast]
+  );
+
+  const sendNotificationEmailSummary = useCallback(async () => {
+    if (!authUser) return null;
+    try {
+      const res = await apiFetch<{
+        ok: boolean;
+        sentCount: number;
+        status: string;
+        error?: string | null;
+        previewSubject?: string;
+        lastSummarySentAt?: string | null;
+      }>('/api/account/notifications/email-summary', { method: 'POST' });
+      await refreshNotifications();
+      if (res.sentCount === 0) {
+        showToast(locale === 'ar' ? 'لا توجد إشعارات لتلخيصها حالياً.' : 'No notifications to summarize right now.', 'info');
+      } else if (res.ok) {
+        showToast(
+          locale === 'ar'
+            ? `تم إرسال الملخص البريدي (${res.sentCount} إشعار).`
+            : `Email summary sent (${res.sentCount} items).`,
+          'success'
+        );
+      } else {
+        showToast(
+          locale === 'ar'
+            ? `تم تجهيز الملخص (${res.sentCount} إشعار) — ${res.error || 'خادم البريد غير مهيأ'}`
+            : `Summary compiled (${res.sentCount} items) — ${res.error || 'SMTP not configured'}`,
+          'info'
+        );
+      }
+      return res;
+    } catch (err) {
+      showToast((err as Error).message, 'error');
+      return null;
+    }
+  }, [authUser, apiFetch, locale, refreshNotifications, showToast]);
+
+  const refreshAuth = useCallback(async (): Promise<AuthSessionUser | null> => {
     try {
       const res = await fetch('/api/auth/me', { credentials: 'include' });
       const data = await res.json();
@@ -476,13 +588,18 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
         } else {
           localStorage.removeItem('nl_wishlist');
         }
+        return data.user as AuthSessionUser;
       } else {
         setAuthUser(null);
         setUnreadNotificationsCount(0);
+        return null;
       }
     } catch {
       setAuthUser(null);
       setUnreadNotificationsCount(0);
+      return null;
+    } finally {
+      setAuthChecked(true);
     }
   }, []);
 
@@ -498,6 +615,8 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
     if (authUser) {
       void refreshNotifications();
     } else {
+      setNotifications([]);
+      setNotificationPrefs(DEFAULT_NOTIFICATION_PREFS);
       setUnreadNotificationsCount(0);
     }
   }, [authUser, refreshNotifications]);
@@ -671,11 +790,19 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
         previewDrafts,
         setPreviewDrafts,
         loading,
+        authChecked,
         refreshBootstrap,
         refreshFxRate,
         refreshAuth,
         unreadNotificationsCount,
+        notifications,
+        notificationPrefs,
         refreshNotifications,
+        markNotificationRead,
+        updateNotificationPreferences,
+        sendNotificationEmailSummary,
+        isSearchOpen,
+        setIsSearchOpen,
         cart,
         addToCart,
         updateCartQty,

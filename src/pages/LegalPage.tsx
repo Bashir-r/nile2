@@ -95,9 +95,33 @@ export function LegalPage() {
           }
         />
       ) : (
-        <div className="border border-[var(--line)] bg-[var(--graphite)] p-6 md:p-8 space-y-4 text-sm text-[var(--muted)] leading-relaxed whitespace-pre-line">
-          {page.body[locale]}
-        </div>
+        <article className="border border-[var(--line)] bg-[var(--graphite)] p-6 md:p-8 space-y-5">
+          {page.updatedAt && (
+            <div className="flex flex-wrap items-center justify-between gap-2 pb-4 border-b border-[var(--line)] text-xs font-mono-tabular text-[var(--muted)]">
+              <span>{locale === 'ar' ? 'الوثيقة الرسمية لمنصة نايل لينك' : 'Official NileLink Marketplace Policy'}</span>
+              <span>
+                {locale === 'ar' ? 'آخر تحديث:' : 'Last updated:'} {new Date(page.updatedAt).toLocaleDateString(locale === 'ar' ? 'ar-LB' : 'en-US')}
+              </span>
+            </div>
+          )}
+          <div className="space-y-4 text-sm text-[var(--muted)] leading-relaxed">
+            {(page.body[locale] || page.body.en)
+              .split(/\n{2,}/)
+              .map((block, idx) => {
+                const trimmed = block.trim();
+                const isHeading = /^(\d+|[١-٩])+[.)]/.test(trimmed) && trimmed.length < 140;
+                return isHeading ? (
+                  <h2 key={idx} className="text-base font-display font-bold text-[var(--bone)] pt-2">
+                    {trimmed}
+                  </h2>
+                ) : (
+                  <p key={idx} className="whitespace-pre-line text-[var(--bone)]/90">
+                    {trimmed}
+                  </p>
+                );
+              })}
+          </div>
+        </article>
       )}
     </div>
   );

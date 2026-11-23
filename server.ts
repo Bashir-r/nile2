@@ -11,7 +11,7 @@ import { ensureEssentialSeed } from './server/db/essentialSeed.ts';
 import { MarketplaceRepo } from './server/db/marketplaceRepo.ts';
 import { isCardGatewayConfigured } from './server/paymentAdapters.ts';
 import { syncDailyLbpRate } from './server/services/currencyRate.ts';
-import { emailAdapter, renderEmailBlocks } from './server/services/email.ts';
+import { emailAdapter, renderEmailBlocks, sendNotificationSummaryForUser } from './server/services/email.ts';
 import { processPendingJobs } from './server/services/jobs.ts';
 import { applySecurityHeaders } from './server/services/securityHeaders.ts';
 import { generateSitemapXml } from './server/services/sitemapGenerator.ts';
@@ -632,6 +632,9 @@ async function createApp() {
           roleKey: req.authUser.roleKey,
           sellerId: req.authUser.sellerId,
           totpEnabled: req.authUser.totpEnabled,
+          emailVerifiedAt: req.authUser.emailVerifiedAt,
+          phoneVerifiedAt: req.authUser.phoneVerifiedAt,
+          isFullyVerified: req.authUser.isFullyVerified,
           preferredLocale: req.authUser.preferredLocale,
           preferredCurrency: req.authUser.preferredCurrency,
           permissions: req.authUser.permissions,
@@ -659,18 +662,30 @@ async function createApp() {
       const ses = await createSession(db, user.id, req);
       setSessionCookies(req, res, ses.rawToken, ses.csrfToken);
       res.status(201).json({
-        user: { ...user, totpEnabled: false, preferredLocale: body.locale || 'en', preferredCurrency: 'USD', permissions: [] },
+        user: {
+          ...user,
+          totpEnabled: false,
+          emailVerifiedAt: null,
+          phoneVerifiedAt: null,
+          isFullyVerified: false,
+          preferredLocale: body.locale || 'en',
+          preferredCurrency: 'USD',
+          permissions: [],
+        },
       });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
   });
 
-  const LoginSchema = z.object({
-    email: z.string().email(),
-    password: z.string().min(1),
-    totpCode: z.string().optional(),
-  });
+  const LoginSchema = z
+    .object({
+      identifier: z.string().min(3).max(190).optional(),
+      email: z.string().min(3).max(190).optional(),
+      password: z.string().min(1),
+      totpCode: z.string().optional(),
+    })
+    .refine((d) => Boolean((d.identifier || d.email || '').trim()), 'Email or phone number is required.');
 
   app.post('/api/auth/login', rateLimit(20, 60_000), async (req, res) => {
     try {
@@ -720,8 +735,34 @@ async function createApp() {
 
   app.post('/api/auth/forgot-password', rateLimit(10, 60_000), async (req, res) => {
     try {
-      const { email } = validateBody(z.object({ email: z.string().email().max(180) }), req.body);
-      const result = await repo.requestPasswordReset(email, getClientIp(req));
+      const body = validateBody(
+        z
+          .object({
+            identifier: z.string().min(3).max(190).optional(),
+            email: z.string().min(3).max(190).optional(),
+            channel: z.enum(['email', 'sms']).optional(),
+          })
+          .refine((d) => Boolean((d.identifier || d.email || '').trim()), 'Email or phone number is required.'),
+        req.body
+      );
+      const result = await repo.requestPasswordResetOtp(body, getClientIp(req));
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/auth/forgot-password/verify-otp', rateLimit(15, 60_000), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          identifier: z.string().min(3).max(190),
+          code: z.string().min(4).max(12),
+          channel: z.enum(['email', 'sms']).optional(),
+        }),
+        req.body
+      );
+      const result = await repo.verifyPasswordResetOtp(body, getClientIp(req));
       res.json(result);
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
@@ -741,6 +782,129 @@ async function createApp() {
       res.json(result);
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  // --- Email & Phone OTP Verification + OTP Sign-In ---
+  app.post('/api/auth/verification/send', requireAuth, rateLimit(10, 60_000), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          channel: z.enum(['email', 'phone']),
+          target: z.string().max(190).optional(),
+        }),
+        req.body
+      );
+      const result = await repo.requestAuthVerificationOtp(req.authUser!.id, body, getClientIp(req));
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/auth/verification/confirm', requireAuth, rateLimit(15, 60_000), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          channel: z.enum(['email', 'phone']),
+          code: z.string().min(4).max(12),
+        }),
+        req.body
+      );
+      const result = await repo.confirmAuthVerificationOtp(req.authUser!.id, body, getClientIp(req));
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/auth/otp/request', rateLimit(10, 60_000), async (req, res) => {
+    try {
+      const body = validateBody(z.object({ identifier: z.string().min(3).max(190) }), req.body);
+      const result = await repo.requestLoginOtp(body.identifier, getClientIp(req));
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/auth/otp/verify', rateLimit(15, 60_000), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          identifier: z.string().min(3).max(190),
+          code: z.string().min(4).max(12),
+          totpCode: z.string().optional(),
+        }),
+        req.body
+      );
+      const logged = await repo.verifyLoginOtp(body, getClientIp(req));
+      const ses = await rotateSession(db, req.authUser?.sessionId, logged.id, req);
+      setSessionCookies(req, res, ses.rawToken, ses.csrfToken);
+      const fullUser = await getSessionUser(db, ses.rawToken);
+      res.json({ user: fullUser });
+    } catch (err) {
+      res.status(401).json({ error: (err as Error).message });
+    }
+  });
+
+  // --- Customer <-> Store Owner System Chat ---
+  app.get('/api/chat/conversations', requireAuth, async (req, res, next) => {
+    try {
+      const sellerFilter = req.query.sellerId ? String(req.query.sellerId) : undefined;
+      const conversations = await repo.listChatConversations(req.authUser!, sellerFilter);
+      res.json({ conversations });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/chat/conversations', requireAuth, rateLimit(30, 60_000), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          sellerId: z.string().min(1).max(64),
+          productId: z.string().max(64).optional(),
+          body: z.string().min(1).max(2000),
+        }),
+        req.body
+      );
+      const result = await repo.startOrSendChatConversation(req.authUser!, body);
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/chat/conversations/:id/messages', requireAuth, async (req, res) => {
+    try {
+      const data = await repo.getChatConversationMessages(req.params.id, req.authUser!);
+      res.json(data);
+    } catch (err) {
+      const msg = (err as Error).message;
+      res.status(msg.startsWith('Forbidden') ? 403 : 404).json({ error: msg });
+    }
+  });
+
+  app.post('/api/chat/conversations/:id/messages', requireAuth, rateLimit(40, 60_000), async (req, res) => {
+    try {
+      const { body } = validateBody(z.object({ body: z.string().min(1).max(2000) }), req.body);
+      const message = await repo.sendChatMessage(req.params.id, req.authUser!, body);
+      res.status(201).json({ message });
+    } catch (err) {
+      const msg = (err as Error).message;
+      res.status(msg.startsWith('Forbidden') ? 403 : 400).json({ error: msg });
+    }
+  });
+
+  app.patch('/api/chat/conversations/:id', requireAuth, async (req, res) => {
+    try {
+      const { status } = validateBody(z.object({ status: z.enum(['open', 'closed']) }), req.body);
+      await repo.updateChatConversationStatus(req.params.id, req.authUser!, status);
+      res.json({ ok: true });
+    } catch (err) {
+      const msg = (err as Error).message;
+      res.status(msg.startsWith('Forbidden') ? 403 : 400).json({ error: msg });
     }
   });
 
@@ -958,7 +1122,12 @@ async function createApp() {
 
   app.get('/api/account/notifications', requireAuth, async (req, res, next) => {
     try {
-      res.json({ notifications: await repo.getUserNotifications(req.authUser!.id) });
+      const [notifications, preferences] = await Promise.all([
+        repo.getUserNotifications(req.authUser!.id),
+        repo.getNotificationPreferences(req.authUser!.id),
+      ]);
+      const unreadCount = notifications.filter((n) => !n.readAt).length;
+      res.json({ notifications, unreadCount, preferences });
     } catch (err) {
       next(err);
     }
@@ -968,6 +1137,41 @@ async function createApp() {
     try {
       const result = await repo.markNotificationRead(req.authUser!.id, req.params.id);
       res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/account/notifications/preferences', requireAuth, async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          emailSummaryEnabled: z.boolean().optional(),
+          summaryFrequency: z.enum(['instant', 'daily', 'weekly', 'off']).optional(),
+          orderUpdates: z.boolean().optional(),
+          priceDrops: z.boolean().optional(),
+          promotionalOffers: z.boolean().optional(),
+        }),
+        req.body
+      );
+      const preferences = await repo.updateNotificationPreferences(req.authUser!.id, body);
+      res.json({ preferences });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/account/notifications/email-summary', requireAuth, rateLimit(5, 60_000), async (req, res) => {
+    try {
+      const summary = await sendNotificationSummaryForUser(db, req.authUser!.id, { force: true });
+      res.json({
+        ok: summary.ok,
+        sentCount: summary.sentCount,
+        status: summary.status,
+        error: summary.error || null,
+        previewSubject: summary.previewSubject,
+        lastSummarySentAt: summary.lastSummarySentAt,
+      });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
@@ -1205,6 +1409,8 @@ async function createApp() {
       if (!sellerId) return res.status(400).json({ error: 'Seller ID required.' });
       const body = validateBody(
         z.object({
+          nameEn: z.string().min(2).max(160).optional(),
+          nameAr: z.string().min(2).max(160).optional(),
           taglineEn: z.string().max(190).optional(),
           taglineAr: z.string().max(190).optional(),
           aboutEn: z.string().max(2000).optional(),
@@ -1215,6 +1421,7 @@ async function createApp() {
           returnPolicyAr: z.string().max(1200).optional(),
           processingHours: z.number().int().min(1).max(360).optional(),
           vacationMode: z.boolean().optional(),
+          workingHours: z.record(z.string().max(32), z.string().max(80)).optional(),
           seoTitle: z.string().max(160).optional(),
           seoDescription: z.string().max(320).optional(),
           storefrontTheme: z.enum(['obsidian-ember', 'sand-atelier', 'cyan-lab', 'sage-studio']).optional(),
@@ -1222,7 +1429,18 @@ async function createApp() {
           selfDeliveryFeesUsdCents: z.record(z.string(), z.number().int().min(0).max(50000)).optional(),
           payoutMethod: z.enum(['whish', 'omt', 'bank']).optional(),
           payoutAccount: z.string().min(3).max(180).optional(),
+          phone: z.string().min(6).max(40).optional(),
           whatsappPhone: z.string().min(6).max(40).optional(),
+          communicationPrefs: z
+            .object({
+              whatsappEnabled: z.boolean(),
+              whatsappGreeting: z.string().max(300).optional(),
+              systemChatEnabled: z.boolean(),
+              phoneCallsEnabled: z.boolean(),
+              preferredChannel: z.enum(['whatsapp', 'system_chat', 'phone']),
+            })
+            .optional(),
+          cityAddress: z.string().max(255).optional(),
           bannerMediaId: z.string().optional(),
           logoMediaId: z.string().optional(),
           locations: z
@@ -1542,6 +1760,19 @@ async function createApp() {
   });
 
   // --- Admin Console Endpoints (Granular Permissions Enforced) ---
+  app.get('/api/admin/session', requireAdminPerm(), async (req, res) => {
+    res.json({
+      authorized: true,
+      user: {
+        id: req.authUser!.id,
+        name: req.authUser!.name,
+        email: req.authUser!.email,
+        roleKey: req.authUser!.roleKey,
+        permissions: req.authUser!.permissions,
+      },
+    });
+  });
+
   app.get('/api/admin/overview', requireAdminPerm(), async (_req, res, next) => {
     try {
       res.json(await repo.getAdminOverview());
@@ -2032,12 +2263,25 @@ async function createApp() {
     }
   });
 
+  app.get('/api/admin/users/:id/activity', requireAdminPerm('users.manage'), async (req, res) => {
+    try {
+      const activity = await repo.getAdminUserActivity(req.params.id);
+      res.json(activity);
+    } catch (err) {
+      res.status(404).json({ error: (err as Error).message });
+    }
+  });
+
   app.patch('/api/admin/users/:id/access', requireAdminPerm('users.manage'), async (req, res) => {
     try {
       const body = validateBody(
         z.object({
           isBlocked: z.boolean().optional(),
+          verifyEmail: z.boolean().optional(),
+          verifyPhone: z.boolean().optional(),
+          roleKey: z.enum(['customer', 'seller_owner', 'seller_staff', 'admin_staff']).optional(),
           permissions: z.array(z.string().min(1).max(80)).optional(),
+          reason: z.string().max(300).optional(),
         }),
         req.body
       );
@@ -2230,6 +2474,12 @@ async function createApp() {
       const body = validateBody(
         z.object({
           chrome: z.object({
+            brandLogoUrl: z
+              .string()
+              .max(500)
+              .refine((v) => !v || isSafeNavOrRelativeUrl(v), 'Unsafe logo URL')
+              .nullable()
+              .optional(),
             headerLinks: z.array(
               z.object({
                 id: z.string().min(1),

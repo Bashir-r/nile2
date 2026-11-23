@@ -54,7 +54,17 @@ export function Footer({
       <div className="max-w-[1440px] mx-auto px-4 md:px-8 py-12">
         <div className="hairline-grid grid-cols-1 md:grid-cols-12">
           <div className="hairline-cell p-6 md:col-span-4">
-            <span className="font-display text-2xl font-bold text-[var(--bone)]">{t.brand}</span>
+            <div className="flex items-center gap-2.5">
+              {chrome.brandLogoUrl && (
+                <img
+                  src={chrome.brandLogoUrl}
+                  alt={t.brand}
+                  referrerPolicy="no-referrer"
+                  className="h-8 w-8 object-contain border border-[var(--line)] bg-[var(--ink)] p-0.5"
+                />
+              )}
+              <span className="font-display text-2xl font-bold text-[var(--bone)]">{t.brand}</span>
+            </div>
             <span className="heading-dash" aria-hidden="true" />
             <p className="mt-4 text-sm text-[var(--muted)] max-w-sm">
               {chrome.footerNote?.[locale] || chrome.footerNote?.en}

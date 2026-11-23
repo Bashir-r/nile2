@@ -29,6 +29,9 @@ export interface User {
   phone: string;
   roleKey: UserRole;
   sellerId?: string;
+  emailVerifiedAt?: string | null;
+  phoneVerifiedAt?: string | null;
+  isFullyVerified?: boolean;
   totpEnabled: boolean;
   preferredLocale: Locale;
   preferredCurrency: Currency;
@@ -49,6 +52,14 @@ export interface StoreLocation {
   isPrimary?: boolean;
 }
 
+export interface SellerCommunicationPrefs {
+  whatsappEnabled: boolean;
+  whatsappGreeting?: string;
+  systemChatEnabled: boolean;
+  phoneCallsEnabled: boolean;
+  preferredChannel: 'whatsapp' | 'system_chat' | 'phone';
+}
+
 export interface Seller {
   id: string;
   slug: string;
@@ -65,7 +76,9 @@ export interface Seller {
   governorate: string;
   district: string;
   cityAddress?: string;
+  phone?: string;
   whatsappPhone: string;
+  communicationPrefs?: SellerCommunicationPrefs | null;
   payoutMethod: 'whish' | 'omt' | 'bank';
   payoutAccount: string;
   commercialRegRef: string;
@@ -82,6 +95,7 @@ export interface Seller {
   returnPolicy?: LocalizedText | null;
   processingHours?: number;
   vacationMode?: boolean;
+  workingHours?: Record<string, string> | null;
   seoTitle?: string | null;
   seoDescription?: string | null;
   locations?: StoreLocation[];
@@ -464,6 +478,7 @@ export interface SiteChromeFooterCol {
 }
 
 export interface SiteChromeSettings {
+  brandLogoUrl?: string | null;
   headerLinks: SiteChromeLink[];
   showMegaMenu: boolean;
   megaMenuDepartments: SiteChromeMegaMenuDept[];
@@ -936,13 +951,30 @@ export interface CustomerAddress {
   isDefault: boolean;
 }
 
+export type NotificationCategory = 'order' | 'price_drop' | 'promo' | 'system';
+
+export type EmailSummaryFrequency = 'instant' | 'daily' | 'weekly' | 'off';
+
 export interface NotificationItem {
   id: string;
   userId: string;
+  category?: NotificationCategory;
   title: LocalizedText;
   body: LocalizedText;
+  actionUrl?: string | null;
+  metadata?: Record<string, unknown> | null;
+  emailedAt?: string | null;
   readAt: string | null;
   createdAt: string;
+}
+
+export interface NotificationPreferences {
+  emailSummaryEnabled: boolean;
+  summaryFrequency: EmailSummaryFrequency;
+  orderUpdates: boolean;
+  priceDrops: boolean;
+  promotionalOffers: boolean;
+  lastSummarySentAt?: string | null;
 }
 
 export interface SupportTicket {
@@ -1098,5 +1130,104 @@ export interface HeroAnnouncementItem {
   tone?: 'ember' | 'cedar' | 'gold' | 'cyan';
   active?: boolean;
 }
+
+export interface ChatConversation {
+  id: string;
+  sellerId: string;
+  sellerName?: LocalizedText;
+  sellerSlug?: string;
+  sellerLogoImage?: string | null;
+  sellerWhatsappPhone?: string;
+  customerUserId: string;
+  customerName: string;
+  productId?: string | null;
+  productTitle?: LocalizedText | null;
+  status: 'open' | 'closed';
+  unreadForSeller: number;
+  unreadForCustomer: number;
+  lastMessagePreview?: string;
+  lastMessageAt: string;
+  createdAt: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  conversationId: string;
+  senderRole: 'customer' | 'seller';
+  senderUserId: string;
+  senderName?: string;
+  body: string;
+  readAt?: string | null;
+  createdAt: string;
+}
+
+export interface AdminUserSummary {
+  id: string;
+  name: string;
+  email: string;
+  phone: string;
+  roleKey: string;
+  isBlocked: boolean;
+  totpEnabled: boolean;
+  emailVerifiedAt?: string | null;
+  phoneVerifiedAt?: string | null;
+  isFullyVerified?: boolean;
+  permissions: string[];
+  ordersCount?: number;
+  activeSessionsCount?: number;
+  sellerId?: string | null;
+  sellerName?: string | null;
+  lastActivityAt?: string | null;
+  createdAt: string;
+}
+
+export interface AdminUserActivityPayload {
+  user: AdminUserSummary & {
+    preferredLocale: Locale;
+    preferredCurrency: Currency;
+    failedLoginAttempts: number;
+    lockedUntil?: string | null;
+    updatedAt: string;
+    seller?: {
+      id: string;
+      slug: string;
+      name: LocalizedText;
+      status: SellerStatus;
+      verified: boolean;
+    } | null;
+  };
+  stats: {
+    ordersCount: number;
+    totalSpentUsdCents: number;
+    reviewsCount: number;
+    ticketsCount: number;
+    activeSessionsCount: number;
+    auditEventsCount: number;
+  };
+  recentOrders: Array<{
+    id: string;
+    orderNumber: string;
+    grandTotalUsdCents: number;
+    paymentMethod: string;
+    paymentStatus: string;
+    createdAt: string;
+  }>;
+  recentReviews: Array<{
+    id: string;
+    productId: string;
+    rating: number;
+    comment: string;
+    moderationStatus: string;
+    createdAt: string;
+  }>;
+  recentTickets: Array<{
+    id: string;
+    subject: string;
+    status: string;
+    createdAt: string;
+  }>;
+  auditEvents: AuditLogEntry[];
+}
+
 
 

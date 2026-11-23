@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { LayoutGrid, MapPin, Search, SlidersHorizontal } from 'lucide-react';
+import { Heart, LayoutGrid, MapPin, Search, SlidersHorizontal } from 'lucide-react';
 import type { NaturalSearchParsed, Product } from '../shared/types.ts';
 import { LEBANON_GOVERNORATES } from '../shared/lebanon.ts';
 import { useMarketplace } from '../context/MarketplaceContext.tsx';
@@ -7,10 +7,10 @@ import { EmptyState, ProductCard, SectionHeading, SkeletonCell } from '../compon
 import { OfferBannerStrip } from '../components/OfferBannerStrip.tsx';
 import { FeaturedPlacementStrip } from '../components/FeaturedPlacementStrip.tsx';
 import { StoreLocationsMap } from '../components/maps/StoreLocationsMap.tsx';
-import { buildBreadcrumbSchema, resolveBaseOrigin, useSeoMetadata } from '../utils/seo.ts';
+import { buildBreadcrumbSchema, resolveAbsoluteUrl, resolveBaseOrigin, useSeoMetadata } from '../utils/seo.ts';
 
 export function CatalogPage({ initialView = 'products' }: { initialView?: 'products' | 'stores-map' }) {
-  const { route, locale, t, sellers, navigate, seoMetadata } = useMarketplace();
+  const { route, locale, t, sellers, navigate, seoMetadata, wishlist } = useMarketplace();
   const params = new URLSearchParams(route.split('?')[1] || '');
 
   const [viewMode, setViewMode] = useState<'products' | 'stores-map'>(
@@ -21,6 +21,7 @@ export function CatalogPage({ initialView = 'products' }: { initialView?: 'produ
   const [department, setDepartment] = useState(params.get('department') || '');
   const [dealsOnly, setDealsOnly] = useState(params.get('deals') === 'true' || params.get('deals') === '1');
   const [inStockOnly, setInStockOnly] = useState(params.get('inStock') === 'true' || params.get('inStock') === '1');
+  const [wishlistOnly, setWishlistOnly] = useState(params.get('wishlist') === 'true' || params.get('wishlist') === '1');
   const [sort, setSort] = useState(params.get('sort') || 'featured');
   const [sellerId, setSellerId] = useState(params.get('sellerId') || '');
   const [items, setItems] = useState<Product[]>([]);
@@ -39,39 +40,79 @@ export function CatalogPage({ initialView = 'products' }: { initialView?: 'produ
     setDepartment(p.get('department') || '');
     setDealsOnly(p.get('deals') === 'true' || p.get('deals') === '1');
     setInStockOnly(p.get('inStock') === 'true' || p.get('inStock') === '1');
+    setWishlistOnly(p.get('wishlist') === 'true' || p.get('wishlist') === '1');
     setSort(p.get('sort') || 'featured');
     setSellerId(p.get('sellerId') || '');
   }, [route, initialView]);
 
+  const deptLabel = useMemo(() => {
+    if (department === 'fashion') return t.fashionTitle;
+    if (department === 'electronics') return t.electronicsTitle;
+    if (department === 'home-gadgets') return t.homeTitle;
+    return '';
+  }, [department, t]);
+
+  const visibleItems = useMemo(
+    () => (wishlistOnly ? items.filter((p) => wishlist.includes(p.id)) : items),
+    [items, wishlistOnly, wishlist]
+  );
+
   const baseOrigin = resolveBaseOrigin(seoMetadata?.global.canonicalBaseUrl);
+  const canonicalPath = wishlistOnly
+    ? '/catalog?wishlist=true'
+    : dealsOnly
+      ? '/catalog?deals=true'
+      : department
+        ? `/catalog?department=${encodeURIComponent(department)}`
+        : '/catalog';
   useSeoMetadata(
     {
       entityType: 'page',
-      entityKey: 'catalog',
-      title:
-        dealsOnly
+      entityKey: department ? `category_${department}` : 'catalog',
+      title: wishlistOnly
+        ? locale === 'ar'
+          ? 'قائمة المفضلة'
+          : 'Saved Wishlist'
+        : dealsOnly
           ? locale === 'ar'
             ? 'العروض والتخفيضات النشطة'
             : 'Active Marketplace Deals'
-          : department
-            ? `${department.replace('-', ' ')} — ${t.allProducts}`
-            : t.allProducts,
-      description:
-        locale === 'ar'
+          : deptLabel
+            ? `${deptLabel} — ${t.allProducts}`
+            : viewMode === 'stores-map'
+              ? locale === 'ar'
+                ? 'خريطة المتاجر اللبنانية'
+                : 'Lebanon Verified Store Locator'
+              : t.allProducts,
+      description: deptLabel
+        ? locale === 'ar'
+          ? `تصفح قسم ${deptLabel} من المتاجر اللبنانية الموثقة مع تسعير مزدوج بالدولار والليرة وتوصيل لجميع المحافظات.`
+          : `Shop curated ${deptLabel} from verified Lebanese merchants with dual USD/LBP pricing and nationwide delivery.`
+        : locale === 'ar'
           ? 'استكشف منتجات التجار اللبنانيين المعتمدين بالبحث الطبيعي والأسعار بالدولار والليرة.'
           : 'Browse verified Lebanese merchant inventory with natural-language search and dual USD/LBP pricing.',
-      canonicalPath: department ? `/catalog?department=${encodeURIComponent(department)}` : '/catalog',
+      canonicalPath,
+      ogImageUrl: visibleItems[0]?.images[0],
+      robots: wishlistOnly ? 'noindex,follow' : 'index,follow',
       schemas: [
+        {
+          '@context': 'https://schema.org',
+          '@type': 'CollectionPage',
+          name: deptLabel || t.allProducts,
+          url: resolveAbsoluteUrl(canonicalPath, baseOrigin),
+          numberOfItems: visibleItems.length,
+        },
         buildBreadcrumbSchema(
           [
             { name: t.brand, path: '/' },
             { name: t.navCatalog, path: '/catalog' },
+            ...(deptLabel ? [{ name: deptLabel, path: `/catalog?department=${encodeURIComponent(department)}` }] : []),
           ],
           baseOrigin
         ),
       ],
     },
-    [department, dealsOnly, items.length]
+    [department, deptLabel, dealsOnly, wishlistOnly, viewMode, visibleItems.length, locale]
   );
 
   useEffect(() => {
@@ -109,6 +150,7 @@ export function CatalogPage({ initialView = 'products' }: { initialView?: 'produ
     setSellerId('');
     setDealsOnly(false);
     setInStockOnly(false);
+    setWishlistOnly(false);
     setSort('featured');
     navigate('/catalog');
   };
@@ -227,6 +269,19 @@ export function CatalogPage({ initialView = 'products' }: { initialView?: 'produ
             {t.filterInStock}
           </button>
 
+          <button
+            type="button"
+            onClick={() => setWishlistOnly((v) => !v)}
+            className={`px-3 py-1.5 text-xs font-medium border inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
+              wishlistOnly
+                ? 'border-[var(--ember)] text-[var(--ember)] font-semibold'
+                : 'border-[var(--line)] text-[var(--muted)] hover:text-[var(--bone)]'
+            }`}
+          >
+            <Heart className={`w-3.5 h-3.5 ${wishlistOnly ? 'fill-[var(--ember)] text-[var(--ember)]' : ''}`} aria-hidden="true" />
+            <span>{locale === 'ar' ? `المفضلة (${wishlist.length})` : `Wishlist (${wishlist.length})`}</span>
+          </button>
+
           <select
             value={sort}
             onChange={(e) => setSort(e.target.value)}
@@ -288,20 +343,32 @@ export function CatalogPage({ initialView = 'products' }: { initialView?: 'produ
           <SkeletonCell />
           <SkeletonCell />
         </div>
-      ) : items.length === 0 ? (
+      ) : visibleItems.length === 0 ? (
         <EmptyState
-          title={locale === 'ar' ? 'لم يتم العثور على منتجات مطابقة' : 'No matching products'}
+          title={
+            wishlistOnly
+              ? locale === 'ar'
+                ? 'قائمة المفضلة فارغة حالياً'
+                : 'Your wishlist is empty'
+              : locale === 'ar'
+                ? 'لم يتم العثور على منتجات مطابقة'
+                : 'No matching products'
+          }
           description={
-            locale === 'ar'
-              ? 'حاول توسيع نطاق السعر أو إزالة أحد الفلاتر.'
-              : 'Try clearing active filters or adjusting your natural-language query.'
+            wishlistOnly
+              ? locale === 'ar'
+                ? 'اضغط على أيقونة القلب على أي منتج لحفظه هنا.'
+                : 'Tap the heart icon on any product card to save items for later.'
+              : locale === 'ar'
+                ? 'حاول توسيع نطاق السعر أو إزالة أحد الفلاتر.'
+                : 'Try clearing active filters or adjusting your natural-language query.'
           }
           actionLabel={locale === 'ar' ? 'إعادة ضبط الفلاتر' : 'Reset Filters'}
           onAction={clearFilters}
         />
       ) : (
         <div className="hairline-grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
-          {items.map((product) => (
+          {visibleItems.map((product) => (
             <ProductCard
               key={product.id}
               product={product}

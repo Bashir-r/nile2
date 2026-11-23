@@ -10,11 +10,46 @@ export interface AuthContextUser {
   roleKey: string;
   sellerId?: string;
   totpEnabled: boolean;
+  emailVerifiedAt: string | null;
+  phoneVerifiedAt: string | null;
+  isFullyVerified: boolean;
   preferredLocale: 'en' | 'ar';
   preferredCurrency: 'USD' | 'LBP';
   permissions: string[];
   sessionId: string;
   csrfToken: string;
+}
+
+const EPHEMERAL_OTP_PEPPER = crypto.randomBytes(32).toString('hex');
+
+export function normalizePhoneNumber(raw: string): string {
+  const cleaned = raw.trim().replace(/[\s().-]/g, '');
+  if (!cleaned) return '';
+  if (cleaned.startsWith('00')) {
+    return `+${cleaned.slice(2)}`;
+  }
+  if (cleaned.startsWith('+')) {
+    return cleaned;
+  }
+  // Lebanese local format: 03xxxxxx, 70xxxxxx, 71xxxxxx, 76xxxxxx, 78xxxxxx, 79xxxxxx, 81xxxxxx, 01xxxxxx..09xxxxxx
+  if (/^0\d{7,8}$/.test(cleaned)) {
+    return `+961${cleaned.slice(1)}`;
+  }
+  if (/^(3|70|71|76|78|79|81)\d{6}$/.test(cleaned)) {
+    return `+961${cleaned}`;
+  }
+  if (/^961\d{7,8}$/.test(cleaned)) {
+    return `+${cleaned}`;
+  }
+  return cleaned;
+}
+
+export function hashOtpCode(userId: string, channel: string, purpose: string, code: string): string {
+  const pepper = process.env.SESSION_SECRET || process.env.CRON_SECRET || EPHEMERAL_OTP_PEPPER;
+  return crypto
+    .createHmac('sha256', pepper)
+    .update(`${userId}:${channel}:${purpose}:${code.trim()}`)
+    .digest('hex');
 }
 
 export const SESSION_COOKIE_NAME = 'nl_session';
@@ -232,14 +267,16 @@ export async function getSessionUser(db: DbClient, rawToken: string): Promise<Au
     phone: string;
     role_key: string;
     totp_enabled: number | boolean;
+    email_verified_at: string | null;
+    phone_verified_at: string | null;
     preferred_locale: string;
     preferred_currency: string;
     is_blocked: number | boolean;
     deleted_at: string | null;
   }>(
     `SELECT s.id AS session_id, s.csrf_token, u.id AS user_id, u.name, u.email, u.phone,
-            u.role_key, u.totp_enabled, u.preferred_locale, u.preferred_currency,
-            u.is_blocked, u.deleted_at
+            u.role_key, u.totp_enabled, u.email_verified_at, u.phone_verified_at,
+            u.preferred_locale, u.preferred_currency, u.is_blocked, u.deleted_at
      FROM sessions s
      INNER JOIN users u ON u.id = s.user_id
      WHERE s.token_hash = ? AND s.expires_at > ?`,
@@ -294,6 +331,9 @@ export async function getSessionUser(db: DbClient, rawToken: string): Promise<Au
           ...userPerms.map((p) => p.permission_key),
         ]);
 
+  const emailVerifiedAt = row.email_verified_at ? String(row.email_verified_at) : null;
+  const phoneVerifiedAt = row.phone_verified_at ? String(row.phone_verified_at) : null;
+
   return {
     id: row.user_id,
     name: row.name,
@@ -302,6 +342,9 @@ export async function getSessionUser(db: DbClient, rawToken: string): Promise<Au
     roleKey: row.role_key,
     sellerId: sellerRow?.id,
     totpEnabled: Boolean(row.totp_enabled),
+    emailVerifiedAt,
+    phoneVerifiedAt,
+    isFullyVerified: Boolean(emailVerifiedAt && phoneVerifiedAt),
     preferredLocale: row.preferred_locale === 'ar' ? 'ar' : 'en',
     preferredCurrency: row.preferred_currency === 'LBP' ? 'LBP' : 'USD',
     permissions: Array.from(permSet),

@@ -3,8 +3,10 @@ import type { DbClient } from '../db/client.ts';
 import { mapLegacySectionType } from '../../src/shared/homeSections.ts';
 import type { EmailBlock, LocalizedText } from '../../src/shared/types.ts';
 import {
+  dispatchDueNotificationDigests,
   processEmailJob,
   processMarketingEmailJob,
+  sendNotificationSummaryForUser,
   type EmailSendPayload,
   type MarketingEmailJobPayload,
 } from './email.ts';
@@ -337,6 +339,10 @@ export async function processPendingJobs(db: DbClient, limit = 20): Promise<{
         await processEmailJob(db, payload as EmailSendPayload);
       } else if (job.job_type === 'send_marketing_email') {
         await processMarketingEmailJob(db, payload as MarketingEmailJobPayload);
+      } else if (job.job_type === 'send_notification_summary') {
+        await sendNotificationSummaryForUser(db, String(payload.userId || ''), {
+          singleNotificationId: payload.notificationId ? String(payload.notificationId) : undefined,
+        });
       }
       await db.execute("UPDATE jobs SET status = 'completed', attempts = attempts + 1 WHERE id = ?", [job.id]);
       processed++;
@@ -375,6 +381,7 @@ export async function processPendingJobs(db: DbClient, limit = 20): Promise<{
   const publishedHomeSnapshots = await publishDueHomePageSnapshots(db);
   const flashSync = await syncFlashSalesAndCampaigns(db);
   const fxSync = await syncDailyLbpRate(db);
+  await dispatchDueNotificationDigests(db);
   const sessRes = await db.execute('DELETE FROM sessions WHERE expires_at <= ?', [now]);
 
   return {

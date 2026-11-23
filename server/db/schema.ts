@@ -761,10 +761,25 @@ export const addresses = mysqlTable('addresses', {
 export const notifications = mysqlTable('notifications', {
   id: varchar('id', { length: 64 }).primaryKey(),
   userId: varchar('user_id', { length: 64 }).notNull(),
+  category: varchar('category', { length: 32 }).notNull().default('system'),
   titleJson: json('title_json').$type<{ en: string; ar: string }>().notNull(),
   bodyJson: json('body_json').$type<{ en: string; ar: string }>().notNull(),
+  actionUrl: varchar('action_url', { length: 255 }),
+  metadataJson: json('metadata_json').$type<Record<string, unknown>>(),
+  emailedAt: timestamp('emailed_at'),
   readAt: timestamp('read_at'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
+});
+
+export const notificationPreferences = mysqlTable('notification_preferences', {
+  userId: varchar('user_id', { length: 64 }).primaryKey(),
+  emailSummaryEnabled: boolean('email_summary_enabled').notNull().default(true),
+  summaryFrequency: varchar('summary_frequency', { length: 16 }).notNull().default('daily'),
+  orderUpdates: boolean('order_updates').notNull().default(true),
+  priceDrops: boolean('price_drops').notNull().default(true),
+  promotionalOffers: boolean('promotional_offers').notNull().default(true),
+  lastSummarySentAt: timestamp('last_summary_sent_at'),
+  updatedAt: timestamp('updated_at').notNull().defaultNow(),
 });
 
 export const emailTemplates = mysqlTable('email_templates', {
@@ -914,4 +929,57 @@ export const automationExecutions = mysqlTable(
   },
   (t) => [uniqueIndex('uq_automation_flow_dedup').on(t.flowId, t.dedupKey)]
 );
+
+export const verificationCodes = mysqlTable(
+  'verification_codes',
+  {
+    id: varchar('id', { length: 64 }).primaryKey(),
+    userId: varchar('user_id', { length: 64 }).notNull(),
+    channel: varchar('channel', { length: 16 }).notNull(), // 'email' | 'phone'
+    target: varchar('target', { length: 190 }).notNull(),
+    purpose: varchar('purpose', { length: 32 }).notNull().default('verify_contact'),
+    codeHash: varchar('code_hash', { length: 128 }).notNull(),
+    attempts: int('attempts').notNull().default(0),
+    expiresAt: timestamp('expires_at').notNull(),
+    consumedAt: timestamp('consumed_at'),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+  },
+  (t) => [index('idx_verif_user_channel').on(t.userId, t.channel)]
+);
+
+export const chatConversations = mysqlTable(
+  'chat_conversations',
+  {
+    id: varchar('id', { length: 64 }).primaryKey(),
+    sellerId: varchar('seller_id', { length: 64 }).notNull(),
+    customerUserId: varchar('customer_user_id', { length: 64 }).notNull(),
+    customerName: varchar('customer_name', { length: 160 }).notNull(),
+    productId: varchar('product_id', { length: 64 }),
+    status: varchar('status', { length: 24 }).notNull().default('open'),
+    unreadForSeller: int('unread_for_seller').notNull().default(0),
+    unreadForCustomer: int('unread_for_customer').notNull().default(0),
+    lastMessagePreview: varchar('last_message_preview', { length: 240 }),
+    lastMessageAt: timestamp('last_message_at').notNull().defaultNow(),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('idx_chat_conv_seller').on(t.sellerId),
+    index('idx_chat_conv_customer').on(t.customerUserId),
+  ]
+);
+
+export const chatMessages = mysqlTable(
+  'chat_messages',
+  {
+    id: varchar('id', { length: 64 }).primaryKey(),
+    conversationId: varchar('conversation_id', { length: 64 }).notNull(),
+    senderRole: varchar('sender_role', { length: 24 }).notNull(), // 'customer' | 'seller' | 'admin'
+    senderUserId: varchar('sender_user_id', { length: 64 }).notNull(),
+    body: text('body').notNull(),
+    readAt: timestamp('read_at'),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+  },
+  (t) => [index('idx_chat_msg_conv').on(t.conversationId)]
+);
+
 

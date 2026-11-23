@@ -69,6 +69,54 @@ export function ChromeAndSeoModal({
         <div className="flex-1 overflow-y-auto p-5 space-y-6 text-xs">
           {tab === 'header' && (
             <>
+              <div className="border border-[var(--line)] bg-[var(--graphite)] p-4 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 className="font-display text-base font-bold text-[var(--bone)]">NileLink Platform Brand Logo</h3>
+                    <p className="text-[11px] text-[var(--muted)]">
+                      Displayed across the storefront header and footer. Clear to render the typographic Cedar mark only.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onPickImage(({ url }) => setDraft((d) => ({ ...d, brandLogoUrl: url })))
+                      }
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-[var(--ember)] text-[var(--ember)] cursor-pointer"
+                    >
+                      <ImagePlus className="w-3.5 h-3.5" /> Pick / Upload Logo
+                    </button>
+                    {draft.brandLogoUrl && (
+                      <button
+                        type="button"
+                        onClick={() => setDraft((d) => ({ ...d, brandLogoUrl: '' }))}
+                        className="px-2.5 py-1.5 border border-[var(--line)] text-[var(--muted)] hover:text-[var(--ember)] cursor-pointer"
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-3">
+                  {draft.brandLogoUrl && (
+                    <div className="border border-[var(--line)] bg-[var(--ink)] p-2 shrink-0">
+                      <img
+                        src={draft.brandLogoUrl}
+                        alt="Platform Logo Preview"
+                        className="h-9 max-w-[160px] object-contain"
+                      />
+                    </div>
+                  )}
+                  <input
+                    value={draft.brandLogoUrl || ''}
+                    onChange={(e) => setDraft((d) => ({ ...d, brandLogoUrl: e.target.value }))}
+                    placeholder="https://... or /uploads/... (optional)"
+                    className="flex-1 min-w-[220px] bg-[var(--ink)] border border-[var(--line)] px-3 py-2 font-mono-tabular text-[var(--bone)]"
+                  />
+                </div>
+              </div>
+
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
                   <h3 className="font-display text-base font-bold text-[var(--bone)]">Top Header Navigation Links</h3>

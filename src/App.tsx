@@ -1,27 +1,41 @@
-import React, { useEffect, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useState } from 'react';
 import { MotionConfig } from 'motion/react';
 import { MarketplaceProvider, useMarketplace } from './context/MarketplaceContext.tsx';
 import { Header } from './components/Header.tsx';
 import { MiniCartDrawer } from './components/MiniCartDrawer.tsx';
 import { MobileBottomNav } from './components/MobileBottomNav.tsx';
 import { Footer } from './components/Footer.tsx';
-import { HomePage } from './pages/HomePage.tsx';
-import { CatalogPage } from './pages/CatalogPage.tsx';
-import { ProductDetailPage } from './pages/ProductDetailPage.tsx';
-import { StorefrontPage } from './pages/StorefrontPage.tsx';
-import { CheckoutPage } from './pages/CheckoutPage.tsx';
-import { OrdersPage } from './pages/OrdersPage.tsx';
-import { SellerDashboardPage } from './pages/SellerDashboardPage.tsx';
-import { AdminDashboardPage } from './pages/AdminDashboardPage.tsx';
-import { StyleguidePage } from './pages/StyleguidePage.tsx';
-import { LegalPage } from './pages/LegalPage.tsx';
-import { CampaignPage } from './pages/CampaignPage.tsx';
-import { AccountPage } from './pages/AccountPage.tsx';
-import { SupportPage } from './pages/SupportPage.tsx';
 import { MarketingOverlayManager } from './components/MarketingOverlayManager.tsx';
-import { EmptyState } from './components/HairlineUI.tsx';
+import { EmptyState, SkeletonCell } from './components/HairlineUI.tsx';
 import { ErrorBoundary } from './components/ErrorBoundary.tsx';
+import { GlobalSearchModal } from './components/GlobalSearchModal.tsx';
 import { useSeoMetadata } from './utils/seo.ts';
+
+const HomePage = lazy(() => import('./pages/HomePage.tsx').then((m) => ({ default: m.HomePage })));
+const CatalogPage = lazy(() => import('./pages/CatalogPage.tsx').then((m) => ({ default: m.CatalogPage })));
+const ProductDetailPage = lazy(() => import('./pages/ProductDetailPage.tsx').then((m) => ({ default: m.ProductDetailPage })));
+const StorefrontPage = lazy(() => import('./pages/StorefrontPage.tsx').then((m) => ({ default: m.StorefrontPage })));
+const CheckoutPage = lazy(() => import('./pages/CheckoutPage.tsx').then((m) => ({ default: m.CheckoutPage })));
+const OrdersPage = lazy(() => import('./pages/OrdersPage.tsx').then((m) => ({ default: m.OrdersPage })));
+const SellerDashboardPage = lazy(() => import('./pages/SellerDashboardPage.tsx').then((m) => ({ default: m.SellerDashboardPage })));
+const AdminDashboardPage = lazy(() => import('./pages/AdminDashboardPage.tsx').then((m) => ({ default: m.AdminDashboardPage })));
+const StyleguidePage = lazy(() => import('./pages/StyleguidePage.tsx').then((m) => ({ default: m.StyleguidePage })));
+const LegalPage = lazy(() => import('./pages/LegalPage.tsx').then((m) => ({ default: m.LegalPage })));
+const CampaignPage = lazy(() => import('./pages/CampaignPage.tsx').then((m) => ({ default: m.CampaignPage })));
+const AccountPage = lazy(() => import('./pages/AccountPage.tsx').then((m) => ({ default: m.AccountPage })));
+const SupportPage = lazy(() => import('./pages/SupportPage.tsx').then((m) => ({ default: m.SupportPage })));
+
+function RouteLoadingFallback() {
+  return (
+    <div className="max-w-[1440px] mx-auto px-4 md:px-8 py-10" aria-busy="true" aria-live="polite">
+      <div className="hairline-grid grid-cols-1 md:grid-cols-3">
+        <SkeletonCell />
+        <SkeletonCell />
+        <SkeletonCell />
+      </div>
+    </div>
+  );
+}
 
 function ToastBanner() {
   const { toast } = useMarketplace();
@@ -123,11 +137,14 @@ function AppShell({ quotaExceeded }: { quotaExceeded: boolean }) {
       <Header />
       <main id="main-content" className="flex-1">
         <ErrorBoundary resetKey={route} locale={locale} onNavigateHome={() => navigate('/')}>
-          <RouterView />
+          <Suspense fallback={<RouteLoadingFallback />}>
+            <RouterView />
+          </Suspense>
         </ErrorBoundary>
       </main>
       <Footer />
       <MiniCartDrawer />
+      <GlobalSearchModal />
       <MobileBottomNav />
       <MarketingOverlayManager />
       <ToastBanner />

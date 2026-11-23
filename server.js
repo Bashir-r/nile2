@@ -662,6 +662,7 @@ var init_homeSections = __esm({
       custom_rich_editorial: "rich_block"
     };
     DEFAULT_SITE_CHROME = {
+      brandLogoUrl: "",
       headerLinks: [
         { id: "nav-catalog", label: { en: "Catalog", ar: "\u0627\u0644\u0643\u062A\u0627\u0644\u0648\u062C" }, url: "/catalog", visible: true },
         { id: "nav-orders", label: { en: "My Orders", ar: "\u0637\u0644\u0628\u0627\u062A\u064A" }, url: "/orders", visible: true },
@@ -1199,6 +1200,30 @@ var init_searchParser = __esm({
 
 // server/services/security.ts
 import crypto2 from "node:crypto";
+function normalizePhoneNumber(raw) {
+  const cleaned = raw.trim().replace(/[\s().-]/g, "");
+  if (!cleaned) return "";
+  if (cleaned.startsWith("00")) {
+    return `+${cleaned.slice(2)}`;
+  }
+  if (cleaned.startsWith("+")) {
+    return cleaned;
+  }
+  if (/^0\d{7,8}$/.test(cleaned)) {
+    return `+961${cleaned.slice(1)}`;
+  }
+  if (/^(3|70|71|76|78|79|81)\d{6}$/.test(cleaned)) {
+    return `+961${cleaned}`;
+  }
+  if (/^961\d{7,8}$/.test(cleaned)) {
+    return `+${cleaned}`;
+  }
+  return cleaned;
+}
+function hashOtpCode(userId, channel, purpose, code) {
+  const pepper = process.env.SESSION_SECRET || process.env.CRON_SECRET || EPHEMERAL_OTP_PEPPER;
+  return crypto2.createHmac("sha256", pepper).update(`${userId}:${channel}:${purpose}:${code.trim()}`).digest("hex");
+}
 function toSqlTimestamp(date = /* @__PURE__ */ new Date()) {
   return date.toISOString().slice(0, 19).replace("T", " ");
 }
@@ -1358,8 +1383,8 @@ async function getSessionUser(db, rawToken) {
   const now = toSqlTimestamp();
   const row = await db.queryOne(
     `SELECT s.id AS session_id, s.csrf_token, u.id AS user_id, u.name, u.email, u.phone,
-            u.role_key, u.totp_enabled, u.preferred_locale, u.preferred_currency,
-            u.is_blocked, u.deleted_at
+            u.role_key, u.totp_enabled, u.email_verified_at, u.phone_verified_at,
+            u.preferred_locale, u.preferred_currency, u.is_blocked, u.deleted_at
      FROM sessions s
      INNER JOIN users u ON u.id = s.user_id
      WHERE s.token_hash = ? AND s.expires_at > ?`,
@@ -1401,6 +1426,8 @@ async function getSessionUser(db, rawToken) {
     ...rolePerms.map((p) => p.permission_key),
     ...userPerms.map((p) => p.permission_key)
   ]);
+  const emailVerifiedAt = row.email_verified_at ? String(row.email_verified_at) : null;
+  const phoneVerifiedAt = row.phone_verified_at ? String(row.phone_verified_at) : null;
   return {
     id: row.user_id,
     name: row.name,
@@ -1409,6 +1436,9 @@ async function getSessionUser(db, rawToken) {
     roleKey: row.role_key,
     sellerId: sellerRow?.id,
     totpEnabled: Boolean(row.totp_enabled),
+    emailVerifiedAt,
+    phoneVerifiedAt,
+    isFullyVerified: Boolean(emailVerifiedAt && phoneVerifiedAt),
     preferredLocale: row.preferred_locale === "ar" ? "ar" : "en",
     preferredCurrency: row.preferred_currency === "LBP" ? "LBP" : "USD",
     permissions: Array.from(permSet),
@@ -1443,9 +1473,10 @@ async function writeAuditLog(txOrDb, input) {
     ]
   );
 }
-var SESSION_COOKIE_NAME, CSRF_COOKIE_NAME, SESSION_TTL_MS, BASE32_ALPHABET;
+var EPHEMERAL_OTP_PEPPER, SESSION_COOKIE_NAME, CSRF_COOKIE_NAME, SESSION_TTL_MS, BASE32_ALPHABET;
 var init_security = __esm({
   "server/services/security.ts"() {
+    EPHEMERAL_OTP_PEPPER = crypto2.randomBytes(32).toString("hex");
     SESSION_COOKIE_NAME = "nl_session";
     CSRF_COOKIE_NAME = "nl_csrf";
     SESSION_TTL_MS = 1e3 * 60 * 60 * 24 * 7;
@@ -1711,7 +1742,250 @@ async function processMarketingEmailJob(db, payload) {
     await db.execute("UPDATE automation_flows SET total_sent = total_sent + 1 WHERE id = ?", [payload.flowId]);
   }
 }
-var SmtpEmailAdapter, emailAdapter;
+function renderNotificationSummaryEmail(opts) {
+  const locale = opts.locale === "ar" ? "ar" : "en";
+  const dir = locale === "ar" ? "rtl" : "ltr";
+  const baseUrl = (opts.appUrl || process.env.APP_URL || "https://nilelink.lb").replace(/\/$/, "");
+  const count = opts.notifications.length;
+  const freqLabel = opts.frequency === "instant" ? locale === "ar" ? "\u062A\u0646\u0628\u064A\u0647 \u0641\u0648\u0631\u064A" : "Instant Alert" : opts.frequency === "weekly" ? locale === "ar" ? "\u0627\u0644\u0645\u0644\u062E\u0635 \u0627\u0644\u0623\u0633\u0628\u0648\u0639\u064A" : "Weekly Summary" : locale === "ar" ? "\u0627\u0644\u0645\u0644\u062E\u0635 \u0627\u0644\u064A\u0648\u0645\u064A" : "Daily Summary";
+  const subject = locale === "ar" ? `\u0646\u0627\u064A\u0644 \u0644\u064A\u0646\u0643 \u2014 ${freqLabel} (${count} ${count === 1 ? "\u0625\u0634\u0639\u0627\u0631" : "\u0625\u0634\u0639\u0627\u0631\u0627\u062A"})` : `NileLink ${freqLabel} \xB7 ${count} ${count === 1 ? "update" : "updates"}`;
+  const grouped = /* @__PURE__ */ new Map();
+  for (const n of opts.notifications) {
+    const cat = n.category || "system";
+    const arr = grouped.get(cat) || [];
+    arr.push(n);
+    grouped.set(cat, arr);
+  }
+  const orderOrder = ["order", "price_drop", "promo", "system"];
+  const textSections = [
+    locale === "ar" ? `\u0645\u0631\u062D\u0628\u0627\u064B ${opts.userName}\u060C \u0625\u0644\u064A\u0643 \u0645\u0644\u062E\u0635 \u0625\u0634\u0639\u0627\u0631\u0627\u062A\u0643 \u0639\u0644\u0649 \u0646\u0627\u064A\u0644 \u0644\u064A\u0646\u0643:` : `Hello ${opts.userName}, here is your NileLink notifications digest:`
+  ];
+  const htmlSections = [];
+  for (const cat of orderOrder) {
+    const items = grouped.get(cat);
+    if (!items || items.length === 0) continue;
+    const labelMeta = CATEGORY_LABELS[cat];
+    const heading = locale === "ar" ? labelMeta.ar : labelMeta.en;
+    textSections.push(`
+## ${heading}`);
+    const itemCards = [];
+    for (const item of items) {
+      const title = locale === "ar" ? item.title.ar || item.title.en : item.title.en || item.title.ar;
+      const body = locale === "ar" ? item.body.ar || item.body.en : item.body.en || item.body.ar;
+      const href = safeEmailUrl(item.actionUrl || "/account?tab=notifications", baseUrl);
+      textSections.push(`- ${title}: ${body} (${href})`);
+      itemCards.push(
+        `<div style="padding:12px 14px;border:1px solid #30343B;background:#17181B;margin-bottom:8px;">
+          <div style="font-size:14px;font-weight:bold;color:#F3EFE8;">${escapeHtml(title)}</div>
+          <div style="margin-top:4px;font-size:13px;line-height:1.5;color:#C7C4BC;">${escapeHtml(body)}</div>
+          <div style="margin-top:8px;">
+            <a href="${escapeHtml(href)}" style="font-size:11px;font-weight:bold;text-transform:uppercase;color:${labelMeta.color};text-decoration:none;border-bottom:1px solid ${labelMeta.color};">${locale === "ar" ? "\u0639\u0631\u0636 \u0627\u0644\u062A\u0641\u0627\u0635\u064A\u0644" : "Open Details"}</a>
+          </div>
+        </div>`
+      );
+    }
+    htmlSections.push(
+      `<div style="padding:18px 24px;border-bottom:1px solid #30343B;background:#222428;">
+        <div style="font-family:monospace;font-size:11px;font-weight:bold;text-transform:uppercase;letter-spacing:1.5px;color:${labelMeta.color};margin-bottom:10px;">
+          ${escapeHtml(heading)} (${items.length})
+        </div>
+        ${itemCards.join("")}
+      </div>`
+    );
+  }
+  const prefsUrl = `${baseUrl}/account?tab=notifications`;
+  textSections.push(
+    locale === "ar" ? `
+\u0625\u062F\u0627\u0631\u0629 \u062A\u0641\u0636\u064A\u0644\u0627\u062A \u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A: ${prefsUrl}` : `
+Manage notification preferences: ${prefsUrl}`
+  );
+  const html = `<!doctype html>
+<html lang="${locale}" dir="${dir}">
+  <body style="margin:0;padding:24px 12px;background:#111215;font-family:Arial,Helvetica,sans-serif;color:#F3EFE8;">
+    <div style="max-width:600px;margin:0 auto;border:1px solid #30343B;background:#222428;">
+      <div style="padding:20px 24px;border-bottom:1px solid #30343B;background:#17181B;">
+        <div style="font-family:monospace;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#EA580C;">NILELINK LEBANON \xB7 ${escapeHtml(freqLabel)}</div>
+        <h1 style="margin:6px 0 0;font-size:20px;line-height:1.3;color:#F3EFE8;">${escapeHtml(
+    locale === "ar" ? `\u0645\u0631\u062D\u0628\u0627\u064B ${opts.userName}` : `Hello ${opts.userName}`
+  )}</h1>
+      </div>
+      ${htmlSections.join("\n")}
+      <div style="padding:16px 24px;background:#17181B;font-size:11px;color:#9CA3AF;text-align:center;">
+        <a href="${escapeHtml(prefsUrl)}" style="color:#C7C4BC;text-decoration:underline;">
+          ${locale === "ar" ? "\u062A\u0639\u062F\u064A\u0644 \u062A\u0641\u0636\u064A\u0644\u0627\u062A \u0627\u0644\u0628\u0631\u064A\u062F \u0627\u0644\u0625\u0644\u0643\u062A\u0631\u0648\u0646\u064A \u0648\u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A" : "Manage Email Digest & Notification Preferences"}
+        </a>
+      </div>
+    </div>
+  </body>
+</html>`;
+  return { subject, html, text: textSections.join("\n") };
+}
+async function sendNotificationSummaryForUser(db, userId, opts = {}) {
+  const user = await db.queryOne(
+    "SELECT id, name, email, preferred_locale, deleted_at, is_blocked FROM users WHERE id = ? LIMIT 1",
+    [userId]
+  );
+  if (!user || user.deleted_at || user.is_blocked || !user.email) {
+    return {
+      ok: false,
+      sentCount: 0,
+      status: "empty",
+      error: "Active user email not found.",
+      previewSubject: "",
+      previewText: "",
+      lastSummarySentAt: null
+    };
+  }
+  const prefRow = await db.queryOne("SELECT * FROM notification_preferences WHERE user_id = ?", [userId]);
+  const frequency = prefRow?.summary_frequency || "daily";
+  const emailEnabled = prefRow ? Boolean(prefRow.email_summary_enabled) : true;
+  if (!opts.force && (!emailEnabled || frequency === "off")) {
+    return {
+      ok: true,
+      sentCount: 0,
+      status: "empty",
+      previewSubject: "",
+      previewText: "",
+      lastSummarySentAt: prefRow?.last_summary_sent_at ? String(prefRow.last_summary_sent_at) : null
+    };
+  }
+  let rows = [];
+  if (opts.singleNotificationId) {
+    rows = await db.query(
+      "SELECT id, category, title_json, body_json, action_url, created_at FROM notifications WHERE id = ? AND user_id = ? LIMIT 1",
+      [opts.singleNotificationId, userId]
+    );
+  } else {
+    rows = await db.query(
+      "SELECT id, category, title_json, body_json, action_url, created_at FROM notifications WHERE user_id = ? AND emailed_at IS NULL AND read_at IS NULL ORDER BY created_at DESC LIMIT 25",
+      [userId]
+    );
+    if (rows.length === 0 && opts.force) {
+      rows = await db.query(
+        "SELECT id, category, title_json, body_json, action_url, created_at FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 15",
+        [userId]
+      );
+    }
+  }
+  const allowOrder = prefRow ? Boolean(prefRow.order_updates) : true;
+  const allowPriceDrop = prefRow ? Boolean(prefRow.price_drops) : true;
+  const allowPromo = prefRow ? Boolean(prefRow.promotional_offers) : true;
+  const entries = [];
+  for (const r of rows) {
+    const cat = r.category || "system";
+    if (!opts.force) {
+      if (cat === "order" && !allowOrder) continue;
+      if (cat === "price_drop" && !allowPriceDrop) continue;
+      if (cat === "promo" && !allowPromo) continue;
+    }
+    const tj = typeof r.title_json === "string" ? JSON.parse(r.title_json) : r.title_json;
+    const bj = typeof r.body_json === "string" ? JSON.parse(r.body_json) : r.body_json;
+    entries.push({
+      id: r.id,
+      category: cat,
+      title: { en: String(tj?.en || ""), ar: String(tj?.ar || tj?.en || "") },
+      body: { en: String(bj?.en || ""), ar: String(bj?.ar || bj?.en || "") },
+      actionUrl: r.action_url ? String(r.action_url) : null,
+      createdAt: String(r.created_at)
+    });
+  }
+  if (entries.length === 0) {
+    return {
+      ok: true,
+      sentCount: 0,
+      status: "empty",
+      previewSubject: "",
+      previewText: "",
+      lastSummarySentAt: prefRow?.last_summary_sent_at ? String(prefRow.last_summary_sent_at) : null
+    };
+  }
+  const locale = user.preferred_locale === "ar" ? "ar" : "en";
+  const rendered = renderNotificationSummaryEmail({
+    userName: user.name,
+    locale,
+    frequency: opts.singleNotificationId ? "instant" : frequency,
+    notifications: entries
+  });
+  const sendRes = await emailAdapter.send({
+    to: user.email,
+    subject: rendered.subject,
+    text: rendered.text,
+    html: rendered.html
+  });
+  const status = sendRes.ok ? "sent" : emailAdapter.isConfigured() ? "failed" : "unconfigured";
+  const now = toSqlTimestamp();
+  await db.execute(
+    "INSERT INTO email_log (id, recipient_email, template_key, status, error_message, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    [
+      `eml-${crypto3.randomUUID()}`,
+      user.email,
+      "notification_summary",
+      status,
+      sendRes.error || null,
+      now
+    ]
+  );
+  if (sendRes.ok || opts.force) {
+    const placeholders = entries.map(() => "?").join(", ");
+    await db.execute(`UPDATE notifications SET emailed_at = ? WHERE id IN (${placeholders})`, [
+      now,
+      ...entries.map((e) => e.id)
+    ]);
+    await db.execute(
+      `INSERT INTO notification_preferences (user_id, email_summary_enabled, summary_frequency, order_updates, price_drops, promotional_offers, last_summary_sent_at, updated_at)
+       VALUES (?, 1, ?, 1, 1, 1, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET last_summary_sent_at = excluded.last_summary_sent_at, updated_at = excluded.updated_at`,
+      [userId, frequency, now, now]
+    ).catch(async () => {
+      await db.execute(
+        `INSERT INTO notification_preferences (user_id, email_summary_enabled, summary_frequency, order_updates, price_drops, promotional_offers, last_summary_sent_at, updated_at)
+         VALUES (?, 1, ?, 1, 1, 1, ?, ?)
+         ON DUPLICATE KEY UPDATE last_summary_sent_at = VALUES(last_summary_sent_at), updated_at = VALUES(updated_at)`,
+        [userId, frequency, now, now]
+      );
+    });
+  }
+  return {
+    ok: sendRes.ok,
+    sentCount: entries.length,
+    status,
+    error: sendRes.error,
+    previewSubject: rendered.subject,
+    previewText: rendered.text,
+    lastSummarySentAt: now
+  };
+}
+async function dispatchDueNotificationDigests(db) {
+  const candidates = await db.query(
+    `SELECT DISTINCT n.user_id
+     FROM notifications n
+     LEFT JOIN notification_preferences np ON np.user_id = n.user_id
+     INNER JOIN users u ON u.id = n.user_id
+     WHERE n.emailed_at IS NULL
+       AND n.read_at IS NULL
+       AND u.deleted_at IS NULL
+       AND u.is_blocked = 0
+       AND COALESCE(np.email_summary_enabled, 1) = 1
+       AND COALESCE(np.summary_frequency, 'daily') IN ('daily', 'weekly')
+     LIMIT 30`
+  );
+  let dispatched = 0;
+  const nowMs = Date.now();
+  for (const row of candidates) {
+    const pref = await db.queryOne(
+      "SELECT summary_frequency, last_summary_sent_at FROM notification_preferences WHERE user_id = ?",
+      [row.user_id]
+    );
+    const freq = pref?.summary_frequency || "daily";
+    const minAgeMs = freq === "weekly" ? 6.9 * 864e5 : 23 * 36e5;
+    const lastMs = pref?.last_summary_sent_at ? Date.parse(pref.last_summary_sent_at) : 0;
+    if (lastMs && nowMs - lastMs < minAgeMs) continue;
+    const res = await sendNotificationSummaryForUser(db, row.user_id, { force: false });
+    if (res.sentCount > 0) dispatched++;
+  }
+  return dispatched;
+}
+var SmtpEmailAdapter, emailAdapter, CATEGORY_LABELS;
 var init_email = __esm({
   "server/services/email.ts"() {
     init_security();
@@ -1746,6 +2020,114 @@ var init_email = __esm({
       }
     };
     emailAdapter = new SmtpEmailAdapter();
+    CATEGORY_LABELS = {
+      order: { en: "Order Status Updates", ar: "\u062A\u062D\u062F\u064A\u062B\u0627\u062A \u062D\u0627\u0644\u0629 \u0627\u0644\u0637\u0644\u0628\u0627\u062A", color: "#06B6D4" },
+      price_drop: { en: "Wishlisted Price Drops", ar: "\u0627\u0646\u062E\u0641\u0627\u0636 \u0623\u0633\u0639\u0627\u0631 \u0627\u0644\u0645\u0641\u0636\u0644\u0629", color: "#65A30D" },
+      promo: { en: "Promotional Offers", ar: "\u0627\u0644\u0639\u0631\u0648\u0636 \u0627\u0644\u062A\u0631\u0648\u064A\u062C\u064A\u0629", color: "#EA580C" },
+      system: { en: "Marketplace Updates", ar: "\u062A\u062D\u062F\u064A\u062B\u0627\u062A \u0627\u0644\u0645\u0646\u0635\u0629", color: "#D97706" }
+    };
+  }
+});
+
+// server/services/sms.ts
+function getProviderConfig() {
+  const provider = (process.env.SMS_PROVIDER || "").trim().toLowerCase();
+  const apiKey = (process.env.SMS_API_KEY || "").trim();
+  const senderId = (process.env.SMS_SENDER_ID || "NileLink").trim();
+  const apiUrl = (process.env.SMS_API_URL || "").trim();
+  return { provider, apiKey, senderId, apiUrl };
+}
+function isAllowedHttpsUrl(raw) {
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+var ProductionSmsAdapter, smsAdapter;
+var init_sms = __esm({
+  "server/services/sms.ts"() {
+    ProductionSmsAdapter = class {
+      isConfigured() {
+        const { provider, apiKey, apiUrl } = getProviderConfig();
+        if (!provider || !apiKey) return false;
+        if (provider === "twilio") {
+          return apiKey.includes(":");
+        }
+        if (provider === "webhook" || provider === "http") {
+          return isAllowedHttpsUrl(apiUrl);
+        }
+        return isAllowedHttpsUrl(apiUrl);
+      }
+      async sendOtp(phone, code, messageText) {
+        const { provider, apiKey, senderId, apiUrl } = getProviderConfig();
+        if (!provider || !apiKey) {
+          return {
+            sent: false,
+            reason: "Configure SMS_PROVIDER and SMS_API_KEY in environment variables."
+          };
+        }
+        const bodyText = messageText || `Your NileLink verification code is: ${code}. Valid for 10 minutes.`;
+        try {
+          if (provider === "twilio") {
+            const sep = apiKey.indexOf(":");
+            if (sep <= 0) {
+              return { sent: false, reason: "Twilio SMS_API_KEY must be formatted as ACCOUNT_SID:AUTH_TOKEN." };
+            }
+            const accountSid = apiKey.slice(0, sep);
+            const authToken = apiKey.slice(sep + 1);
+            const form = new URLSearchParams({
+              To: phone,
+              From: senderId,
+              Body: bodyText
+            });
+            const res2 = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(accountSid)}/Messages.json`, {
+              method: "POST",
+              headers: {
+                Authorization: `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`,
+                "Content-Type": "application/x-www-form-urlencoded"
+              },
+              body: form.toString(),
+              signal: AbortSignal.timeout(8e3)
+            });
+            if (!res2.ok) {
+              const errText = await res2.text().catch(() => "");
+              return { sent: false, reason: `Twilio gateway error (${res2.status}): ${errText.slice(0, 160)}` };
+            }
+            return { sent: true };
+          }
+          if (!isAllowedHttpsUrl(apiUrl)) {
+            return {
+              sent: false,
+              reason: "Configure an HTTPS SMS_API_URL endpoint for non-Twilio SMS providers."
+            };
+          }
+          const res = await fetch(apiUrl, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              to: phone,
+              senderId,
+              message: bodyText,
+              code
+            }),
+            signal: AbortSignal.timeout(8e3)
+          });
+          if (!res.ok) {
+            const errText = await res.text().catch(() => "");
+            return { sent: false, reason: `SMS gateway error (${res.status}): ${errText.slice(0, 160)}` };
+          }
+          return { sent: true };
+        } catch (err) {
+          return { sent: false, reason: err.message || "SMS request failed." };
+        }
+      }
+    };
+    smsAdapter = new ProductionSmsAdapter();
   }
 });
 
@@ -2146,6 +2528,10 @@ async function processPendingJobs(db, limit = 20) {
         await processEmailJob(db, payload);
       } else if (job.job_type === "send_marketing_email") {
         await processMarketingEmailJob(db, payload);
+      } else if (job.job_type === "send_notification_summary") {
+        await sendNotificationSummaryForUser(db, String(payload.userId || ""), {
+          singleNotificationId: payload.notificationId ? String(payload.notificationId) : void 0
+        });
       }
       await db.execute("UPDATE jobs SET status = 'completed', attempts = attempts + 1 WHERE id = ?", [job.id]);
       processed++;
@@ -2181,6 +2567,7 @@ async function processPendingJobs(db, limit = 20) {
   const publishedHomeSnapshots = await publishDueHomePageSnapshots(db);
   const flashSync = await syncFlashSalesAndCampaigns(db);
   const fxSync = await syncDailyLbpRate(db);
+  await dispatchDueNotificationDigests(db);
   const sessRes = await db.execute("DELETE FROM sessions WHERE expires_at <= ?", [now]);
   return {
     processed,
@@ -2232,6 +2619,7 @@ var init_marketplaceRepo = __esm({
     init_searchParser();
     init_security();
     init_email();
+    init_sms();
     init_jobs();
     DEFAULT_SEO_METADATA = {
       global: {
@@ -2413,16 +2801,28 @@ var init_marketplaceRepo = __esm({
         const pwErr = validatePasswordStrength(input.password);
         if (pwErr) throw new Error(pwErr);
         const emailNorm = input.email.trim().toLowerCase();
+        const phoneNorm = normalizePhoneNumber(input.phone);
+        if (!phoneNorm || phoneNorm.length < 7) {
+          throw new Error("Please provide a valid Lebanese or international phone number.");
+        }
         return this.db.transaction(async (tx) => {
-          const dup = await tx.queryOne("SELECT id FROM users WHERE LOWER(email) = ?", [emailNorm]);
+          const dup = await tx.queryOne(
+            "SELECT id FROM users WHERE LOWER(email) = ? AND deleted_at IS NULL",
+            [emailNorm]
+          );
           if (dup) throw new Error("An account with this email already exists.");
+          const dupPhone = await tx.queryOne(
+            "SELECT id FROM users WHERE phone = ? AND deleted_at IS NULL",
+            [phoneNorm]
+          );
+          if (dupPhone) throw new Error("An account with this phone number already exists.");
           const id = `usr-${crypto5.randomUUID()}`;
           const now = toSqlTimestamp();
           const locale = input.locale === "ar" ? "ar" : "en";
           await tx.execute(
             `INSERT INTO users (id, name, email, phone, password_hash, role_key, preferred_locale, preferred_currency, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, 'customer', ?, 'USD', ?, ?)`,
-            [id, input.name.trim(), emailNorm, input.phone.trim(), hashPassword(input.password), locale, now, now]
+            [id, input.name.trim(), emailNorm, phoneNorm, hashPassword(input.password), locale, now, now]
           );
           await queueEmail(tx, {
             to: emailNorm,
@@ -2437,14 +2837,42 @@ var init_marketplaceRepo = __esm({
             entityId: id,
             ipAddress: input.ipAddress
           });
-          return { id, name: input.name.trim(), email: emailNorm, phone: input.phone.trim(), roleKey: "customer" };
+          return {
+            id,
+            name: input.name.trim(),
+            email: emailNorm,
+            phone: phoneNorm,
+            roleKey: "customer",
+            emailVerifiedAt: null,
+            phoneVerifiedAt: null,
+            isFullyVerified: false
+          };
         });
       }
+      async findUserByIdentifier(identifier) {
+        const clean = identifier.trim();
+        if (!clean) return null;
+        if (clean.includes("@")) {
+          return this.db.queryOne("SELECT * FROM users WHERE LOWER(email) = ? AND deleted_at IS NULL LIMIT 1", [clean.toLowerCase()]);
+        }
+        const phoneNorm = normalizePhoneNumber(clean);
+        const digitsTail = phoneNorm.replace(/[^\d]/g, "").slice(-8);
+        return this.db.queryOne(
+          `SELECT * FROM users
+       WHERE deleted_at IS NULL
+         AND (phone = ? OR phone = ? OR (? != '' AND REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '+', '') LIKE ?))
+       LIMIT 1`,
+          [phoneNorm, clean, digitsTail, `%${digitsTail}`]
+        );
+      }
       async loginUser(input) {
-        const emailNorm = input.email.trim().toLowerCase();
-        const row = await this.db.queryOne("SELECT * FROM users WHERE LOWER(email) = ? LIMIT 1", [emailNorm]);
+        const rawId = (input.identifier || input.email || "").trim();
+        if (!rawId) {
+          throw new Error("Email or phone number is required.");
+        }
+        const row = await this.findUserByIdentifier(rawId);
         if (!row || row.deleted_at) {
-          throw new Error("Invalid email or password.");
+          throw new Error("Invalid email/phone or password.");
         }
         if (row.is_blocked) {
           throw new Error("Account suspended. Contact NileLink support.");
@@ -2460,7 +2888,7 @@ var init_marketplaceRepo = __esm({
             "UPDATE users SET failed_login_attempts = ?, locked_until = ? WHERE id = ?",
             [nextAttempts, lockedUntil, row.id]
           );
-          throw new Error("Invalid email or password.");
+          throw new Error("Invalid email/phone or password.");
         }
         const requiresTotp = row.role_key === "admin_super" || row.role_key === "admin_staff" || Boolean(row.totp_enabled);
         if (requiresTotp) {
@@ -2495,6 +2923,305 @@ var init_marketplaceRepo = __esm({
         }
         await this.db.execute("UPDATE users SET totp_enabled = 1 WHERE id = ?", [userId]);
         return { totpEnabled: true };
+      }
+      async dispatchOtpChallenge(tx, input) {
+        const code = String(crypto5.randomInt(1e5, 1e6));
+        const now = toSqlTimestamp();
+        const expiresAt = toSqlTimestamp(new Date(Date.now() + 10 * 6e4));
+        const codeHash = hashOtpCode(input.userId, input.channel, input.purpose, code);
+        await tx.execute(
+          "UPDATE verification_codes SET consumed_at = ? WHERE user_id = ? AND channel = ? AND purpose = ? AND consumed_at IS NULL",
+          [now, input.userId, input.channel, input.purpose]
+        );
+        await tx.execute(
+          `INSERT INTO verification_codes (id, user_id, channel, target, purpose, code_hash, attempts, expires_at, consumed_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, ?)`,
+          [`vcd-${crypto5.randomUUID()}`, input.userId, input.channel, input.target, input.purpose, codeHash, expiresAt, now]
+        );
+        let deliveryConfigured = false;
+        if (input.channel === "email") {
+          deliveryConfigured = emailAdapter.isConfigured();
+          const isReset = input.purpose === "password_reset_otp";
+          const subject = input.locale === "ar" ? isReset ? `\u0631\u0645\u0632 \u0625\u0639\u0627\u062F\u0629 \u062A\u0639\u064A\u064A\u0646 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0641\u064A \u0646\u0627\u064A\u0644 \u0644\u064A\u0646\u0643: ${code}` : `\u0631\u0645\u0632 \u0627\u0644\u062A\u062D\u0642\u0642 \u0627\u0644\u062E\u0627\u0635 \u0628\u0643 \u0641\u064A \u0646\u0627\u064A\u0644 \u0644\u064A\u0646\u0643: ${code}` : isReset ? `Your NileLink password reset code: ${code}` : `Your NileLink verification code: ${code}`;
+          const text2 = input.locale === "ar" ? isReset ? `\u0645\u0631\u062D\u0628\u0627\u064B ${input.userName}\u060C
+\u0631\u0645\u0632 \u0625\u0639\u0627\u062F\u0629 \u062A\u0639\u064A\u064A\u0646 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062E\u0627\u0635 \u0628\u0643 \u0647\u0648: ${code}
+\u0635\u0627\u0644\u062D \u0644\u0645\u062F\u0629 10 \u062F\u0642\u0627\u0626\u0642. \u0644\u0627 \u062A\u0634\u0627\u0631\u0643 \u0647\u0630\u0627 \u0627\u0644\u0631\u0645\u0632 \u0645\u0639 \u0623\u064A \u0634\u062E\u0635.` : `\u0645\u0631\u062D\u0628\u0627\u064B ${input.userName}\u060C
+\u0631\u0645\u0632 \u0627\u0644\u062A\u062D\u0642\u0642 \u0627\u0644\u062E\u0627\u0635 \u0628\u0643 \u0647\u0648: ${code}
+\u0635\u0627\u0644\u062D \u0644\u0645\u062F\u0629 10 \u062F\u0642\u0627\u0626\u0642.` : isReset ? `Hello ${input.userName},
+Your NileLink password reset verification code is: ${code}
+It expires in 10 minutes. Never share this code.` : `Hello ${input.userName},
+Your NileLink verification code is: ${code}
+It expires in 10 minutes.`;
+          const sent = deliveryConfigured ? await emailAdapter.send({ to: input.target, subject, text: text2 }) : { ok: false };
+          const templateKey = input.purpose === "login_otp" ? "otp_login" : input.purpose === "password_reset_otp" ? "password_reset_otp" : "otp_verify";
+          await tx.execute(
+            "INSERT INTO email_log (id, recipient_email, template_key, status, error_message, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+              `eml-${crypto5.randomUUID()}`,
+              input.target,
+              templateKey,
+              sent.ok ? "sent" : "queued_preview",
+              sent.ok ? null : "SMTP not configured",
+              now
+            ]
+          );
+        } else {
+          deliveryConfigured = smsAdapter.isConfigured();
+          if (deliveryConfigured) {
+            const smsText = input.purpose === "password_reset_otp" ? `NileLink password reset code: ${code}. Valid for 10 minutes.` : `NileLink verification code: ${code}. Valid for 10 minutes.`;
+            await smsAdapter.sendOtp(input.target, code, smsText);
+          }
+        }
+        return { code, deliveryConfigured };
+      }
+      async requestAuthVerificationOtp(userId, input, ipAddress) {
+        const user = await this.db.queryOne("SELECT id, name, email, phone, preferred_locale FROM users WHERE id = ? AND deleted_at IS NULL", [userId]);
+        if (!user) throw new Error("User not found.");
+        const locale = user.preferred_locale === "ar" ? "ar" : "en";
+        let target = input.channel === "email" ? user.email : user.phone;
+        if (input.target && input.target.trim()) {
+          if (input.channel === "email") {
+            const cleanEmail = input.target.trim().toLowerCase();
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+              throw new Error("Invalid email address format.");
+            }
+            if (cleanEmail !== user.email.toLowerCase()) {
+              const dup = await this.db.queryOne(
+                "SELECT id FROM users WHERE LOWER(email) = ? AND id != ? AND deleted_at IS NULL",
+                [cleanEmail, userId]
+              );
+              if (dup) throw new Error("This email address is already linked to another account.");
+              await this.db.execute(
+                "UPDATE users SET email = ?, email_verified_at = NULL, updated_at = ? WHERE id = ?",
+                [cleanEmail, toSqlTimestamp(), userId]
+              );
+            }
+            target = cleanEmail;
+          } else {
+            const normPhone = normalizePhoneNumber(input.target);
+            if (!normPhone || normPhone.length < 7) {
+              throw new Error("Invalid phone number format.");
+            }
+            if (normPhone !== user.phone) {
+              const dup = await this.db.queryOne(
+                "SELECT id FROM users WHERE phone = ? AND id != ? AND deleted_at IS NULL",
+                [normPhone, userId]
+              );
+              if (dup) throw new Error("This phone number is already linked to another account.");
+              await this.db.execute(
+                "UPDATE users SET phone = ?, phone_verified_at = NULL, updated_at = ? WHERE id = ?",
+                [normPhone, toSqlTimestamp(), userId]
+              );
+            }
+            target = normPhone;
+          }
+        }
+        if (!target) {
+          throw new Error(`No ${input.channel} is configured on this account.`);
+        }
+        const dispatched = await this.db.transaction(async (tx) => {
+          const res = await this.dispatchOtpChallenge(tx, {
+            userId: user.id,
+            userName: user.name,
+            channel: input.channel,
+            target,
+            purpose: "verify_contact",
+            locale
+          });
+          await writeAuditLog(tx, {
+            actorUserId: user.id,
+            action: `auth.verification_otp_sent.${input.channel}`,
+            entityType: "user",
+            entityId: user.id,
+            after: { target },
+            ipAddress
+          });
+          return res;
+        });
+        const isDevOrTest = process.env.NODE_ENV !== "production";
+        return {
+          ok: true,
+          channel: input.channel,
+          target,
+          deliveryConfigured: dispatched.deliveryConfigured,
+          expiresInSeconds: 600,
+          ...isDevOrTest && !dispatched.deliveryConfigured ? { devOtpCode: dispatched.code } : {}
+        };
+      }
+      async confirmAuthVerificationOtp(userId, input, ipAddress) {
+        const cleanCode = input.code.replace(/\s+/g, "");
+        if (!/^\d{6}$/.test(cleanCode)) {
+          throw new Error("Please enter the 6-digit verification code.");
+        }
+        const now = toSqlTimestamp();
+        const txRes = await this.db.transaction(async (tx) => {
+          const challenge = await tx.queryOne(
+            `SELECT id, target, code_hash, attempts, expires_at
+         FROM verification_codes
+         WHERE user_id = ? AND channel = ? AND purpose = 'verify_contact' AND consumed_at IS NULL
+         ORDER BY created_at DESC LIMIT 1`,
+            [userId, input.channel]
+          );
+          if (!challenge || String(challenge.expires_at) <= now) {
+            throw new Error("Verification code expired or not found. Request a new code.");
+          }
+          if (Number(challenge.attempts) >= 5) {
+            throw new Error("Too many invalid verification attempts. Please request a new code.");
+          }
+          const submittedHash = hashOtpCode(userId, input.channel, "verify_contact", cleanCode);
+          if (!timingSafeStringMatch(challenge.code_hash, submittedHash)) {
+            await tx.execute("UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?", [challenge.id]);
+            return { failed: true, message: "Invalid 6-digit verification code." };
+          }
+          await tx.execute("UPDATE verification_codes SET consumed_at = ? WHERE id = ?", [now, challenge.id]);
+          if (input.channel === "email") {
+            await tx.execute("UPDATE users SET email_verified_at = ?, updated_at = ? WHERE id = ?", [now, now, userId]);
+          } else {
+            await tx.execute("UPDATE users SET phone_verified_at = ?, updated_at = ? WHERE id = ?", [now, now, userId]);
+          }
+          await writeAuditLog(tx, {
+            actorUserId: userId,
+            action: `auth.verification_confirmed.${input.channel}`,
+            entityType: "user",
+            entityId: userId,
+            after: { target: challenge.target },
+            ipAddress
+          });
+          const updated = await tx.queryOne(
+            "SELECT email_verified_at, phone_verified_at FROM users WHERE id = ?",
+            [userId]
+          );
+          const emailVerifiedAt = updated?.email_verified_at ? String(updated.email_verified_at) : null;
+          const phoneVerifiedAt = updated?.phone_verified_at ? String(updated.phone_verified_at) : null;
+          return {
+            failed: false,
+            data: {
+              ok: true,
+              channel: input.channel,
+              emailVerifiedAt,
+              phoneVerifiedAt,
+              isFullyVerified: Boolean(emailVerifiedAt && phoneVerifiedAt)
+            }
+          };
+        });
+        if (txRes.failed) {
+          throw new Error(txRes.message);
+        }
+        return txRes.data;
+      }
+      async requestLoginOtp(identifier, ipAddress) {
+        const clean = identifier.trim();
+        const channel = clean.includes("@") ? "email" : "phone";
+        const user = await this.findUserByIdentifier(clean);
+        if (!user || user.deleted_at || user.is_blocked) {
+          return { ok: true, channel, deliveryConfigured: true, expiresInSeconds: 600 };
+        }
+        const target = channel === "email" ? user.email : user.phone;
+        const locale = user.preferred_locale === "ar" ? "ar" : "en";
+        const dispatched = await this.db.transaction(async (tx) => {
+          const res = await this.dispatchOtpChallenge(tx, {
+            userId: user.id,
+            userName: user.name,
+            channel,
+            target,
+            purpose: "login_otp",
+            locale
+          });
+          await writeAuditLog(tx, {
+            actorUserId: user.id,
+            action: `auth.login_otp_requested.${channel}`,
+            entityType: "user",
+            entityId: user.id,
+            ipAddress
+          });
+          return res;
+        });
+        const isDevOrTest = process.env.NODE_ENV !== "production";
+        return {
+          ok: true,
+          channel,
+          deliveryConfigured: dispatched.deliveryConfigured,
+          expiresInSeconds: 600,
+          ...isDevOrTest && !dispatched.deliveryConfigured ? { devOtpCode: dispatched.code } : {}
+        };
+      }
+      async verifyLoginOtp(input, ipAddress) {
+        const clean = input.identifier.trim();
+        const cleanCode = input.code.replace(/\s+/g, "");
+        if (!/^\d{6}$/.test(cleanCode)) {
+          throw new Error("Please enter the 6-digit OTP code.");
+        }
+        const user = await this.findUserByIdentifier(clean);
+        if (!user || user.deleted_at) {
+          throw new Error("Invalid credentials or expired OTP code.");
+        }
+        if (user.is_blocked) {
+          throw new Error("Account suspended. Contact NileLink support.");
+        }
+        const nowMs = Date.now();
+        if (user.locked_until && (/* @__PURE__ */ new Date(user.locked_until.replace(" ", "T") + "Z")).getTime() > nowMs) {
+          throw new Error("Too many failed sign-in attempts. Please wait 15 minutes before retrying.");
+        }
+        const channel = clean.includes("@") ? "email" : "phone";
+        const now = toSqlTimestamp();
+        const requiresTotp = user.role_key === "admin_super" || user.role_key === "admin_staff" || Boolean(user.totp_enabled);
+        if (requiresTotp) {
+          if (!user.totp_secret || !input.totpCode || !verifyTotpCode(user.totp_secret, input.totpCode)) {
+            throw new Error("Valid 6-digit 2FA authenticator code is required for this account.");
+          }
+        }
+        const txRes = await this.db.transaction(async (tx) => {
+          const challenge = await tx.queryOne(
+            `SELECT id, code_hash, attempts, expires_at
+         FROM verification_codes
+         WHERE user_id = ? AND channel = ? AND purpose = 'login_otp' AND consumed_at IS NULL
+         ORDER BY created_at DESC LIMIT 1`,
+            [user.id, channel]
+          );
+          if (!challenge || String(challenge.expires_at) <= now) {
+            throw new Error("Invalid credentials or expired OTP code.");
+          }
+          if (Number(challenge.attempts) >= 5) {
+            throw new Error("Too many failed OTP attempts. Please request a new code.");
+          }
+          const submittedHash = hashOtpCode(user.id, channel, "login_otp", cleanCode);
+          if (!timingSafeStringMatch(challenge.code_hash, submittedHash)) {
+            await tx.execute("UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?", [challenge.id]);
+            return { failed: true, message: "Invalid credentials or expired OTP code." };
+          }
+          await tx.execute("UPDATE verification_codes SET consumed_at = ? WHERE id = ?", [now, challenge.id]);
+          if (channel === "email" && !user.email_verified_at) {
+            await tx.execute(
+              "UPDATE users SET email_verified_at = ?, failed_login_attempts = 0, locked_until = NULL, updated_at = ? WHERE id = ?",
+              [now, now, user.id]
+            );
+          } else if (channel === "phone" && !user.phone_verified_at) {
+            await tx.execute(
+              "UPDATE users SET phone_verified_at = ?, failed_login_attempts = 0, locked_until = NULL, updated_at = ? WHERE id = ?",
+              [now, now, user.id]
+            );
+          } else {
+            await tx.execute(
+              "UPDATE users SET failed_login_attempts = 0, locked_until = NULL, updated_at = ? WHERE id = ?",
+              [now, user.id]
+            );
+          }
+          await writeAuditLog(tx, {
+            actorUserId: user.id,
+            action: `auth.login_otp_verified.${channel}`,
+            entityType: "user",
+            entityId: user.id,
+            ipAddress
+          });
+          return {
+            failed: false,
+            user: { id: user.id, name: user.name, email: user.email, roleKey: user.role_key }
+          };
+        });
+        if (txRes.failed) {
+          throw new Error(txRes.message);
+        }
+        return txRes.user;
       }
       async createAdminStaff(input) {
         const pwErr = validatePasswordStrength(input.password);
@@ -2536,6 +3263,17 @@ var init_marketplaceRepo = __esm({
           "SELECT plan_tier, status, next_due_at FROM subscriptions WHERE seller_id = ? ORDER BY created_at DESC LIMIT 1",
           [row.id]
         );
+        const socialRaw = row.social_links_json ? parseJson(row.social_links_json, {}) : {};
+        const storedComm = socialRaw?.communicationPrefs || null;
+        const whatsappPhoneVal = String(row.whatsapp_phone || row.phone || "");
+        const phoneVal = row.phone ? String(row.phone) : String(row.whatsapp_phone || "");
+        const communicationPrefs = {
+          whatsappEnabled: storedComm?.whatsappEnabled !== void 0 ? Boolean(storedComm.whatsappEnabled) : Boolean(whatsappPhoneVal),
+          whatsappGreeting: typeof storedComm?.whatsappGreeting === "string" ? storedComm.whatsappGreeting : "",
+          systemChatEnabled: storedComm?.systemChatEnabled !== void 0 ? Boolean(storedComm.systemChatEnabled) : true,
+          phoneCallsEnabled: storedComm?.phoneCallsEnabled !== void 0 ? Boolean(storedComm.phoneCallsEnabled) : Boolean(phoneVal),
+          preferredChannel: storedComm?.preferredChannel === "system_chat" || storedComm?.preferredChannel === "phone" ? storedComm.preferredChannel : "whatsapp"
+        };
         return {
           id: String(row.id),
           slug: String(row.slug),
@@ -2552,7 +3290,9 @@ var init_marketplaceRepo = __esm({
           governorate: String(row.governorate),
           district: String(row.district),
           cityAddress: String(row.city_address || ""),
-          whatsappPhone: String(row.whatsapp_phone || row.phone || ""),
+          phone: phoneVal,
+          whatsappPhone: whatsappPhoneVal,
+          communicationPrefs,
           payoutMethod: String(row.payout_method || "whish"),
           payoutAccount: String(row.payout_account || ""),
           commercialRegRef: String(row.commercial_reg_ref || ""),
@@ -2569,6 +3309,7 @@ var init_marketplaceRepo = __esm({
           returnPolicy: row.return_policy_json ? parseJson(row.return_policy_json, null) : null,
           processingHours: row.processing_hours !== null && row.processing_hours !== void 0 ? Number(row.processing_hours) : 24,
           vacationMode: Boolean(row.vacation_mode),
+          workingHours: row.working_hours_json ? parseJson(row.working_hours_json, null) : null,
           seoTitle: row.seo_title ? String(row.seo_title) : null,
           seoDescription: row.seo_description ? String(row.seo_description) : null,
           locations: row.locations_json ? parseJson(row.locations_json, []) : [],
@@ -2626,7 +3367,7 @@ var init_marketplaceRepo = __esm({
         const rows = await this.db.query(
           `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
               st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.locations_json, st.rating_avg_x10, st.review_count,
-              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.working_hours_json, ss.return_policy_json, ss.social_links_json, ss.seo_title, ss.seo_description
        FROM sellers sel
        INNER JOIN stores st ON st.seller_id = sel.id
        LEFT JOIN store_settings ss ON ss.store_id = st.id
@@ -2641,7 +3382,7 @@ var init_marketplaceRepo = __esm({
         const row = await this.db.queryOne(
           `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
               st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.locations_json, st.rating_avg_x10, st.review_count,
-              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.working_hours_json, ss.return_policy_json, ss.social_links_json, ss.seo_title, ss.seo_description
        FROM sellers sel
        INNER JOIN stores st ON st.seller_id = sel.id
        LEFT JOIN store_settings ss ON ss.store_id = st.id
@@ -2654,7 +3395,7 @@ var init_marketplaceRepo = __esm({
         const row = await this.db.queryOne(
           `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
               st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.locations_json, st.rating_avg_x10, st.review_count,
-              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.working_hours_json, ss.return_policy_json, ss.social_links_json, ss.seo_title, ss.seo_description
        FROM sellers sel
        INNER JOIN stores st ON st.seller_id = sel.id
        LEFT JOIN store_settings ss ON ss.store_id = st.id
@@ -2912,26 +3653,67 @@ var init_marketplaceRepo = __esm({
       }
       async getUserWishlist(userId) {
         const rows = await this.db.query(
-          "SELECT product_id FROM wishlists WHERE user_id = ? ORDER BY created_at DESC",
+          `SELECT w.product_id
+       FROM wishlists w
+       INNER JOIN products p ON p.id = w.product_id
+       WHERE w.user_id = ? AND p.deleted_at IS NULL
+       ORDER BY w.created_at DESC`,
           [userId]
         );
         return rows.map((r) => r.product_id);
       }
       async toggleUserWishlist(userId, productId) {
+        const cleanId = productId.trim();
+        const prod = await this.db.queryOne(
+          "SELECT id FROM products WHERE id = ? AND deleted_at IS NULL",
+          [cleanId]
+        );
+        if (!prod) {
+          throw new Error("Product not found.");
+        }
         const existing = await this.db.queryOne(
           "SELECT id FROM wishlists WHERE user_id = ? AND product_id = ?",
-          [userId, productId]
+          [userId, cleanId]
         );
         if (existing) {
           await this.db.execute("DELETE FROM wishlists WHERE id = ?", [existing.id]);
         } else {
           await this.db.execute(
             "INSERT INTO wishlists (id, user_id, product_id, created_at) VALUES (?, ?, ?, ?)",
-            [`wsh-${crypto5.randomUUID()}`, userId, productId, toSqlTimestamp()]
+            [`wsh-${crypto5.randomUUID()}`, userId, cleanId, toSqlTimestamp()]
           );
         }
         const wishlist = await this.getUserWishlist(userId);
         return { wished: !existing, wishlist };
+      }
+      async syncUserWishlist(userId, productIds) {
+        const uniqueIds = Array.from(new Set(productIds.map((id) => String(id || "").trim()).filter(Boolean))).slice(0, 200);
+        if (uniqueIds.length === 0) {
+          return this.getUserWishlist(userId);
+        }
+        const now = toSqlTimestamp();
+        for (const productId of uniqueIds) {
+          const prod = await this.db.queryOne(
+            "SELECT id FROM products WHERE id = ? AND deleted_at IS NULL",
+            [productId]
+          );
+          if (!prod) continue;
+          const existing = await this.db.queryOne(
+            "SELECT id FROM wishlists WHERE user_id = ? AND product_id = ?",
+            [userId, productId]
+          );
+          if (!existing) {
+            await this.db.execute(
+              "INSERT INTO wishlists (id, user_id, product_id, created_at) VALUES (?, ?, ?, ?)",
+              [`wsh-${crypto5.randomUUID()}`, userId, productId, now]
+            );
+          }
+        }
+        return this.getUserWishlist(userId);
+      }
+      async removeUserWishlistItem(userId, productId) {
+        await this.db.execute("DELETE FROM wishlists WHERE user_id = ? AND product_id = ?", [userId, productId.trim()]);
+        return this.getUserWishlist(userId);
       }
       // --- Commission Resolution & Orders ---
       async resolveCommissionBps(sellerId, categoryId, tx = this.db) {
@@ -3345,7 +4127,8 @@ var init_marketplaceRepo = __esm({
               {
                 en: `Your order totaling $${(grandTotalUsdCents / 100).toFixed(2)} is confirmed.`,
                 ar: `\u062A\u0645 \u062A\u0623\u0643\u064A\u062F \u0637\u0644\u0628\u0643 \u0628\u0642\u064A\u0645\u0629 ${(grandTotalUsdCents / 100).toFixed(2)} \u062F\u0648\u0644\u0627\u0631.`
-              }
+              },
+              { category: "order", actionUrl: "/orders", metadata: { orderId, orderNumber } }
             );
           }
           for (const [, bucket] of matchingSubOrderEntries) {
@@ -3356,7 +4139,8 @@ var init_marketplaceRepo = __esm({
               {
                 en: `${bucket.items.length} item(s) ordered from ${bucket.seller.name.en}.`,
                 ar: `\u062A\u0645 \u0637\u0644\u0628 ${bucket.items.length} \u0645\u0646\u062A\u062C \u0645\u0646 \u0645\u062A\u062C\u0631\u0643 ${bucket.seller.name.ar}.`
-              }
+              },
+              { category: "order", actionUrl: "/seller", metadata: { orderId, orderNumber } }
             );
           }
           await writeAuditLog(tx, {
@@ -3629,7 +4413,7 @@ var init_marketplaceRepo = __esm({
             await tx.queryOne(
               `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
                   st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.locations_json, st.rating_avg_x10, st.review_count,
-                  ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+                  ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.working_hours_json, ss.return_policy_json, ss.social_links_json, ss.seo_title, ss.seo_description
            FROM sellers sel INNER JOIN stores st ON st.seller_id = sel.id LEFT JOIN store_settings ss ON ss.store_id = st.id
            WHERE sel.id = ?`,
               [sellerId]
@@ -3896,11 +4680,24 @@ var init_marketplaceRepo = __esm({
       }
       async updateSellerProfile(sellerId, actorUserId, patch, ipAddress) {
         return this.db.transaction(async (tx) => {
-          const storeRow = await tx.queryOne("SELECT id, tagline_json, about_json, announcement_json, locations_json FROM stores WHERE seller_id = ?", [sellerId]);
+          const storeRow = await tx.queryOne("SELECT id, name_json, tagline_json, about_json, announcement_json, locations_json FROM stores WHERE seller_id = ?", [sellerId]);
           if (!storeRow) throw new Error("Store not found.");
+          if (patch.bannerMediaId) {
+            const bm = await tx.queryOne("SELECT id FROM media WHERE id = ?", [patch.bannerMediaId]);
+            if (!bm) throw new Error("Banner image media asset not found.");
+          }
+          if (patch.logoMediaId) {
+            const lm = await tx.queryOne("SELECT id FROM media WHERE id = ?", [patch.logoMediaId]);
+            if (!lm) throw new Error("Store logo media asset not found.");
+          }
+          const currName = parseJson(storeRow.name_json, { en: "", ar: "" });
           const currTagline = parseJson(storeRow.tagline_json, { en: "", ar: "" });
           const currAbout = parseJson(storeRow.about_json, { en: "", ar: "" });
           const currAnn = storeRow.announcement_json ? parseJson(storeRow.announcement_json, { en: "", ar: "" }) : { en: "", ar: "" };
+          const nextName = {
+            en: patch.nameEn !== void 0 && patch.nameEn.trim() ? patch.nameEn.trim() : currName.en,
+            ar: patch.nameAr !== void 0 && patch.nameAr.trim() ? patch.nameAr.trim() : currName.ar
+          };
           const nextTagline = {
             en: patch.taglineEn !== void 0 ? patch.taglineEn : currTagline.en,
             ar: patch.taglineAr !== void 0 ? patch.taglineAr : currTagline.ar
@@ -3945,7 +4742,7 @@ var init_marketplaceRepo = __esm({
             nextLocationsJson = JSON.stringify(normalizedLocs);
           }
           await tx.execute(
-            `UPDATE stores SET tagline_json = ?, about_json = ?,
+            `UPDATE stores SET name_json = ?, tagline_json = ?, about_json = ?,
          announcement_json = COALESCE(?, announcement_json),
          theme_id = COALESCE(?, theme_id),
          banner_media_id = COALESCE(?, banner_media_id),
@@ -3954,6 +4751,7 @@ var init_marketplaceRepo = __esm({
          updated_at = ?
          WHERE id = ?`,
             [
+              JSON.stringify(nextName),
               JSON.stringify(nextTagline),
               JSON.stringify(nextAbout),
               nextAnn ? JSON.stringify(nextAnn) : null,
@@ -3973,26 +4771,42 @@ var init_marketplaceRepo = __esm({
             ar: patch.returnPolicyAr !== void 0 ? patch.returnPolicyAr : currRet.ar
           } : currRet;
           const nextFees = patch.selfDeliveryFeesUsdCents !== void 0 ? patch.selfDeliveryFeesUsdCents : parseJson(settingsRow?.self_delivery_fees_json, {});
+          const currWorkingHours = settingsRow?.working_hours_json ? parseJson(settingsRow.working_hours_json, null) : null;
+          const nextWorkingHours = patch.workingHours !== void 0 ? patch.workingHours : currWorkingHours;
+          const currSocial = settingsRow?.social_links_json ? parseJson(settingsRow.social_links_json, {}) : {};
+          const nextSocial = patch.communicationPrefs !== void 0 ? {
+            ...currSocial,
+            communicationPrefs: {
+              whatsappEnabled: Boolean(patch.communicationPrefs.whatsappEnabled),
+              whatsappGreeting: (patch.communicationPrefs.whatsappGreeting || "").trim().slice(0, 300),
+              systemChatEnabled: Boolean(patch.communicationPrefs.systemChatEnabled),
+              phoneCallsEnabled: Boolean(patch.communicationPrefs.phoneCallsEnabled),
+              preferredChannel: patch.communicationPrefs.preferredChannel || "whatsapp"
+            }
+          } : currSocial;
           await tx.execute(
             `UPDATE store_settings
-         SET delivery_mode = ?, self_delivery_fees_json = ?, processing_hours = ?, vacation_mode = ?, return_policy_json = ?, seo_title = ?, seo_description = ?
+         SET delivery_mode = ?, self_delivery_fees_json = ?, processing_hours = ?, vacation_mode = ?, working_hours_json = ?, return_policy_json = ?, social_links_json = ?, seo_title = ?, seo_description = ?
          WHERE store_id = ?`,
             [
               patch.deliveryMode || settingsRow?.delivery_mode || "platform",
               JSON.stringify(nextFees),
               patch.processingHours !== void 0 ? Math.max(1, Math.min(360, Math.trunc(patch.processingHours))) : Number(settingsRow?.processing_hours ?? 24),
               patch.vacationMode !== void 0 ? patch.vacationMode ? 1 : 0 : settingsRow?.vacation_mode ? 1 : 0,
+              nextWorkingHours ? JSON.stringify(nextWorkingHours) : null,
               JSON.stringify(nextRet),
+              JSON.stringify(nextSocial),
               patch.seoTitle !== void 0 ? patch.seoTitle.trim() || null : settingsRow?.seo_title ?? null,
               patch.seoDescription !== void 0 ? patch.seoDescription.trim() || null : settingsRow?.seo_description ?? null,
               storeRow.id
             ]
           );
-          if (patch.payoutMethod || patch.payoutAccount !== void 0 || patch.whatsappPhone !== void 0 || primaryLocation) {
+          if (patch.payoutMethod || patch.payoutAccount !== void 0 || patch.phone !== void 0 || patch.whatsappPhone !== void 0 || patch.cityAddress !== void 0 || primaryLocation) {
             await tx.execute(
               `UPDATE sellers
            SET payout_method = COALESCE(?, payout_method),
                payout_account = COALESCE(?, payout_account),
+               phone = COALESCE(?, phone),
                whatsapp_phone = COALESCE(?, whatsapp_phone),
                governorate = COALESCE(?, governorate),
                district = COALESCE(?, district),
@@ -4002,10 +4816,11 @@ var init_marketplaceRepo = __esm({
               [
                 patch.payoutMethod || null,
                 patch.payoutAccount !== void 0 ? patch.payoutAccount.trim() : null,
+                patch.phone !== void 0 ? normalizePhoneNumber(patch.phone) || patch.phone.trim() : null,
                 patch.whatsappPhone !== void 0 ? patch.whatsappPhone.trim() : null,
                 primaryLocation?.governorate || null,
                 primaryLocation?.district || null,
-                primaryLocation?.address || null,
+                patch.cityAddress !== void 0 ? patch.cityAddress.trim() : primaryLocation?.address || null,
                 toSqlTimestamp(),
                 sellerId
               ]
@@ -4022,7 +4837,7 @@ var init_marketplaceRepo = __esm({
           const updatedSellerRow = await tx.queryOne(
             `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
                 st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.locations_json, st.rating_avg_x10, st.review_count,
-                ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+                ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.working_hours_json, ss.return_policy_json, ss.social_links_json, ss.seo_title, ss.seo_description
          FROM sellers sel INNER JOIN stores st ON st.seller_id = sel.id LEFT JOIN store_settings ss ON ss.store_id = st.id
          WHERE sel.id = ? LIMIT 1`,
             [sellerId]
@@ -4205,6 +5020,16 @@ var init_marketplaceRepo = __esm({
                 {
                   en: `Shipment status changed to ${nextStatus}${patch.trackingCode ? ` (Tracking: ${patch.trackingCode})` : ""}.`,
                   ar: `\u062A\u0645 \u062A\u062D\u062F\u064A\u062B \u062D\u0627\u0644\u0629 \u0627\u0644\u0634\u062D\u0646\u0629 \u0625\u0644\u0649 ${nextStatus}${patch.trackingCode ? ` (\u0631\u0645\u0632 \u0627\u0644\u062A\u062A\u0628\u0639: ${patch.trackingCode})` : ""}.`
+                },
+                {
+                  category: "order",
+                  actionUrl: "/orders",
+                  metadata: {
+                    subOrderId,
+                    orderNumber: orderRow.order_number,
+                    status: nextStatus,
+                    trackingCode: patch.trackingCode || null
+                  }
                 }
               );
             }
@@ -4455,7 +5280,7 @@ var init_marketplaceRepo = __esm({
         const sellerRows = await this.db.query(
           `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
               st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.locations_json, st.rating_avg_x10, st.review_count,
-              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.working_hours_json, ss.return_policy_json, ss.social_links_json, ss.seo_title, ss.seo_description
        FROM sellers sel
        INNER JOIN stores st ON st.seller_id = sel.id
        LEFT JOIN store_settings ss ON ss.store_id = st.id
@@ -4623,13 +5448,22 @@ var init_marketplaceRepo = __esm({
           });
         }
         const userSummaryRows = await this.db.query(
-          "SELECT id, name, email, phone, role_key, is_blocked, totp_enabled, created_at FROM users WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 120"
+          "SELECT id, name, email, phone, role_key, is_blocked, totp_enabled, email_verified_at, phone_verified_at, created_at FROM users WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 120"
         );
         const users2 = [];
         for (const u of userSummaryRows) {
-          const perms = await this.db.query("SELECT permission_key FROM user_permissions WHERE user_id = ?", [
-            u.id
+          const [perms, ordCntRow, sessCntRow, lastAuditRow] = await Promise.all([
+            this.db.query("SELECT permission_key FROM user_permissions WHERE user_id = ?", [u.id]),
+            this.db.queryOne("SELECT COUNT(*) AS cnt FROM orders WHERE user_id = ?", [u.id]),
+            this.db.queryOne("SELECT COUNT(*) AS cnt FROM sessions WHERE user_id = ?", [u.id]),
+            this.db.queryOne(
+              "SELECT created_at FROM audit_log WHERE actor_user_id = ? OR (entity_type = 'user' AND entity_id = ?) ORDER BY created_at DESC LIMIT 1",
+              [u.id, u.id]
+            )
           ]);
+          const ownedSeller = sellers2.find((s) => s.userId === u.id) || null;
+          const emailVerifiedAt = u.email_verified_at ? String(u.email_verified_at) : null;
+          const phoneVerifiedAt = u.phone_verified_at ? String(u.phone_verified_at) : null;
           users2.push({
             id: u.id,
             name: u.name,
@@ -4638,7 +5472,15 @@ var init_marketplaceRepo = __esm({
             roleKey: u.role_key,
             isBlocked: Boolean(u.is_blocked),
             totpEnabled: Boolean(u.totp_enabled),
+            emailVerifiedAt,
+            phoneVerifiedAt,
+            isFullyVerified: Boolean(emailVerifiedAt && phoneVerifiedAt),
             permissions: perms.map((p) => p.permission_key),
+            ordersCount: Number(ordCntRow?.cnt ?? 0),
+            activeSessionsCount: Number(sessCntRow?.cnt ?? 0),
+            sellerId: ownedSeller?.id ?? null,
+            sellerName: ownedSeller ? ownedSeller.name.en : null,
+            lastActivityAt: lastAuditRow?.created_at ? String(lastAuditRow.created_at) : String(u.created_at),
             createdAt: String(u.created_at)
           });
         }
@@ -4807,7 +5649,7 @@ var init_marketplaceRepo = __esm({
           const updatedRow = await tx.queryOne(
             `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
                 st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.locations_json, st.rating_avg_x10, st.review_count,
-                ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+                ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.working_hours_json, ss.return_policy_json, ss.social_links_json, ss.seo_title, ss.seo_description
          FROM sellers sel INNER JOIN stores st ON st.seller_id = sel.id LEFT JOIN store_settings ss ON ss.store_id = st.id
          WHERE sel.id = ? LIMIT 1`,
             [sellerId]
@@ -6676,7 +7518,11 @@ var init_marketplaceRepo = __esm({
           ipAddress
         });
         const row = await this.db.queryOne("SELECT * FROM offers WHERE id = ?", [id]);
-        return this.mapOfferRow(row);
+        const mappedOffer = this.mapOfferRow(row);
+        if (mappedOffer.active && mappedOffer.approvalStatus === "approved") {
+          await this.dispatchOfferActivatedNotifications(this.db, mappedOffer);
+        }
+        return mappedOffer;
       }
       async adminUpdateOffer(id, actorUserId, patch, ipAddress) {
         const existing = await this.db.queryOne("SELECT * FROM offers WHERE id = ?", [id]);
@@ -6719,7 +7565,12 @@ var init_marketplaceRepo = __esm({
           `SELECT o.*, st.name_json AS seller_name_json FROM offers o LEFT JOIN stores st ON st.seller_id = o.seller_id WHERE o.id = ?`,
           [id]
         );
-        return this.mapOfferRow(row);
+        const mappedOffer = this.mapOfferRow(row);
+        const becameActive = (String(existing.approval_status) !== "approved" || !Boolean(existing.active)) && mappedOffer.approvalStatus === "approved" && mappedOffer.active;
+        if (becameActive) {
+          await this.dispatchOfferActivatedNotifications(this.db, mappedOffer);
+        }
+        return mappedOffer;
       }
       async adminDeleteOffer(id, actorUserId, ipAddress) {
         await this.db.execute("DELETE FROM offers WHERE id = ?", [id]);
@@ -6835,6 +7686,9 @@ var init_marketplaceRepo = __esm({
             await tx.query("SELECT * FROM flash_sales WHERE id = ?", [id]),
             tx
           );
+          if (created.status === "active") {
+            await this.dispatchFlashSaleNotifications(tx, created);
+          }
           return created;
         });
       }
@@ -6864,6 +7718,9 @@ var init_marketplaceRepo = __esm({
         const [row] = await this.hydrateFlashSales(
           await this.db.query("SELECT * FROM flash_sales WHERE id = ?", [id])
         );
+        if (String(existing.status) !== "active" && row.status === "active") {
+          await this.dispatchFlashSaleNotifications(this.db, row);
+        }
         return row;
       }
       async adminUpdateFlashSaleStatus(id, actorUserId, status, ipAddress) {
@@ -6952,7 +7809,20 @@ var init_marketplaceRepo = __esm({
           ipAddress
         });
         const row = await this.db.queryOne("SELECT * FROM campaigns WHERE id = ?", [id]);
-        return this.mapCampaignRow(row);
+        const created = this.mapCampaignRow(row);
+        if (created.status === "active") {
+          await this.notifyPromotionalOfferFanout(this.db, {
+            entityType: "campaign",
+            entityId: created.id,
+            title: created.title,
+            body: {
+              en: `${created.subtitle.en || created.description.en || "New curated campaign live on NileLink."}`,
+              ar: `${created.subtitle.ar || created.description.ar || "\u062D\u0645\u0644\u0629 \u0639\u0631\u0648\u0636 \u062C\u062F\u064A\u062F\u0629 \u0645\u062A\u0627\u062D\u0629 \u0627\u0644\u0622\u0646 \u0639\u0644\u0649 \u0646\u0627\u064A\u0644 \u0644\u064A\u0646\u0643."}`
+            },
+            actionUrl: `/campaign/${created.slug}`
+          });
+        }
+        return created;
       }
       async adminUpdateCampaign(id, actorUserId, patch, ipAddress) {
         const existingRow = await this.db.queryOne("SELECT * FROM campaigns WHERE id = ?", [id]);
@@ -6984,7 +7854,20 @@ var init_marketplaceRepo = __esm({
           ipAddress
         });
         const row = await this.db.queryOne("SELECT * FROM campaigns WHERE id = ?", [id]);
-        return this.mapCampaignRow(row);
+        const updated = this.mapCampaignRow(row);
+        if (existing.status !== "active" && updated.status === "active") {
+          await this.notifyPromotionalOfferFanout(this.db, {
+            entityType: "campaign",
+            entityId: updated.id,
+            title: updated.title,
+            body: {
+              en: `${updated.subtitle.en || updated.description.en || "New promotional campaign is now live."}`,
+              ar: `${updated.subtitle.ar || updated.description.ar || "\u0627\u0646\u0637\u0644\u0642\u062A \u062D\u0645\u0644\u0629 \u0639\u0631\u0648\u0636 \u062A\u0631\u0648\u064A\u062C\u064A\u0629 \u062C\u062F\u064A\u062F\u0629 \u0627\u0644\u0622\u0646."}`
+            },
+            actionUrl: `/campaign/${updated.slug}`
+          });
+        }
+        return updated;
       }
       async adminDeleteCampaign(id, actorUserId, ipAddress) {
         await this.db.execute("DELETE FROM campaigns WHERE id = ?", [id]);
@@ -7067,7 +7950,11 @@ var init_marketplaceRepo = __esm({
           ipAddress
         });
         const row = await this.db.queryOne("SELECT * FROM offers WHERE id = ?", [id]);
-        return this.mapOfferRow(row);
+        const offer = this.mapOfferRow(row);
+        if (offer.approvalStatus === "approved" && offer.active) {
+          await this.dispatchOfferActivatedNotifications(this.db, offer);
+        }
+        return offer;
       }
       // --- Step 5: Customer Segments, Email Block Campaigns & Automated Flows ---
       mapSegmentRow(row) {
@@ -7770,19 +8657,264 @@ var init_marketplaceRepo = __esm({
           values: parseJson(r.values_json, [])
         }));
       }
-      async createNotification(txOrDb, userId, title, body) {
-        await txOrDb.execute(
-          "INSERT INTO notifications (id, user_id, title_json, body_json, read_at, created_at) VALUES (?, ?, ?, ?, NULL, ?)",
-          [`ntf-${crypto5.randomUUID()}`, userId, JSON.stringify(title), JSON.stringify(body), toSqlTimestamp()]
+      async getNotificationPreferences(userId, txOrDb = this.db) {
+        const row = await txOrDb.queryOne("SELECT * FROM notification_preferences WHERE user_id = ?", [userId]);
+        return {
+          emailSummaryEnabled: row ? Boolean(row.email_summary_enabled) : true,
+          summaryFrequency: row?.summary_frequency || "daily",
+          orderUpdates: row ? Boolean(row.order_updates) : true,
+          priceDrops: row ? Boolean(row.price_drops) : true,
+          promotionalOffers: row ? Boolean(row.promotional_offers) : true,
+          lastSummarySentAt: row?.last_summary_sent_at ? String(row.last_summary_sent_at) : null
+        };
+      }
+      async updateNotificationPreferences(userId, patch) {
+        const current = await this.getNotificationPreferences(userId);
+        const next = {
+          emailSummaryEnabled: patch.emailSummaryEnabled ?? current.emailSummaryEnabled,
+          summaryFrequency: patch.summaryFrequency ?? current.summaryFrequency,
+          orderUpdates: patch.orderUpdates ?? current.orderUpdates,
+          priceDrops: patch.priceDrops ?? current.priceDrops,
+          promotionalOffers: patch.promotionalOffers ?? current.promotionalOffers,
+          lastSummarySentAt: current.lastSummarySentAt ?? null
+        };
+        const now = toSqlTimestamp();
+        const existing = await this.db.queryOne(
+          "SELECT user_id FROM notification_preferences WHERE user_id = ?",
+          [userId]
         );
+        if (existing) {
+          await this.db.execute(
+            `UPDATE notification_preferences
+         SET email_summary_enabled = ?, summary_frequency = ?, order_updates = ?, price_drops = ?, promotional_offers = ?, updated_at = ?
+         WHERE user_id = ?`,
+            [
+              next.emailSummaryEnabled ? 1 : 0,
+              next.summaryFrequency,
+              next.orderUpdates ? 1 : 0,
+              next.priceDrops ? 1 : 0,
+              next.promotionalOffers ? 1 : 0,
+              now,
+              userId
+            ]
+          );
+        } else {
+          await this.db.execute(
+            `INSERT INTO notification_preferences (user_id, email_summary_enabled, summary_frequency, order_updates, price_drops, promotional_offers, last_summary_sent_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
+            [
+              userId,
+              next.emailSummaryEnabled ? 1 : 0,
+              next.summaryFrequency,
+              next.orderUpdates ? 1 : 0,
+              next.priceDrops ? 1 : 0,
+              next.promotionalOffers ? 1 : 0,
+              now
+            ]
+          );
+        }
+        return this.getNotificationPreferences(userId);
+      }
+      async createNotification(txOrDb, userId, title, body, opts) {
+        const category = opts?.category || "system";
+        const prefs = await this.getNotificationPreferences(userId, txOrDb);
+        if (opts?.respectPreference !== false) {
+          if (category === "order" && !prefs.orderUpdates) return null;
+          if (category === "price_drop" && !prefs.priceDrops) return null;
+          if (category === "promo" && !prefs.promotionalOffers) return null;
+        }
+        const id = `ntf-${crypto5.randomUUID()}`;
+        const now = toSqlTimestamp();
+        await txOrDb.execute(
+          "INSERT INTO notifications (id, user_id, category, title_json, body_json, action_url, metadata_json, emailed_at, read_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+          [
+            id,
+            userId,
+            category,
+            JSON.stringify(title),
+            JSON.stringify(body),
+            opts?.actionUrl || null,
+            opts?.metadata ? JSON.stringify(opts.metadata) : null,
+            now
+          ]
+        );
+        if (prefs.emailSummaryEnabled && prefs.summaryFrequency === "instant") {
+          await txOrDb.execute(
+            "INSERT INTO jobs (id, job_type, payload_json, status, attempts, run_at, created_at) VALUES (?, ?, ?, ?, 0, ?, ?)",
+            [
+              `job-${crypto5.randomUUID()}`,
+              "send_notification_summary",
+              JSON.stringify({ userId, notificationId: id }),
+              "queued",
+              now,
+              now
+            ]
+          );
+        }
+        return id;
+      }
+      async notifyWishlistPriceDrop(txOrDb, input) {
+        if (input.newPriceUsdCents >= input.oldPriceUsdCents || input.newPriceUsdCents <= 0) return 0;
+        const prod = await txOrDb.queryOne(
+          "SELECT id, slug, title_json FROM products WHERE id = ? AND deleted_at IS NULL",
+          [input.productId]
+        );
+        if (!prod) return 0;
+        const prodTitle = parseJson(prod.title_json, { en: "Product", ar: "\u0645\u0646\u062A\u062C" });
+        const oldUsd = (input.oldPriceUsdCents / 100).toFixed(2);
+        const newUsd = (input.newPriceUsdCents / 100).toFixed(2);
+        const pctOff = Math.max(1, Math.round((input.oldPriceUsdCents - input.newPriceUsdCents) / input.oldPriceUsdCents * 100));
+        const wishers = await txOrDb.query(
+          `SELECT DISTINCT w.user_id
+       FROM wishlists w
+       INNER JOIN users u ON u.id = w.user_id
+       WHERE w.product_id = ? AND u.deleted_at IS NULL AND u.is_blocked = 0`,
+          [input.productId]
+        );
+        let sent = 0;
+        for (const w of wishers) {
+          const createdId = await this.createNotification(
+            txOrDb,
+            w.user_id,
+            {
+              en: `Price drop: ${prodTitle.en} (-${pctOff}%)`,
+              ar: `\u0627\u0646\u062E\u0641\u0627\u0636 \u0627\u0644\u0633\u0639\u0631: ${prodTitle.ar} (-${pctOff}%)`
+            },
+            {
+              en: `${prodTitle.en} dropped from $${oldUsd} to $${newUsd}${input.offerTitle?.en ? ` (${input.offerTitle.en})` : ""}.`,
+              ar: `\u0627\u0646\u062E\u0641\u0636 \u0633\u0639\u0631 ${prodTitle.ar} \u0645\u0646 $${oldUsd} \u0625\u0644\u0649 $${newUsd}${input.offerTitle?.ar ? ` (${input.offerTitle.ar})` : ""}.`
+            },
+            {
+              category: "price_drop",
+              actionUrl: `/product/${prod.slug}`,
+              metadata: {
+                productId: prod.id,
+                oldPriceUsdCents: input.oldPriceUsdCents,
+                newPriceUsdCents: input.newPriceUsdCents,
+                percentOff: pctOff
+              }
+            }
+          );
+          if (createdId) sent++;
+        }
+        return sent;
+      }
+      async notifyPromotionalOfferFanout(txOrDb, input) {
+        const users2 = await txOrDb.query(
+          `SELECT id FROM users
+       WHERE deleted_at IS NULL AND is_blocked = 0 AND role_key IN ('customer', 'seller_owner')
+       LIMIT 300`
+        );
+        let sent = 0;
+        for (const u of users2) {
+          const createdId = await this.createNotification(txOrDb, u.id, input.title, input.body, {
+            category: "promo",
+            actionUrl: input.actionUrl,
+            metadata: { entityType: input.entityType, entityId: input.entityId }
+          });
+          if (createdId) sent++;
+        }
+        return sent;
+      }
+      async dispatchOfferActivatedNotifications(txOrDb, offer) {
+        if (!["percent", "fixed_usd_cents", "flash_percent"].includes(offer.offerType)) {
+          if (offer.targetType === "all" || offer.targetType === "category") {
+            await this.notifyPromotionalOfferFanout(txOrDb, {
+              entityType: "offer",
+              entityId: offer.id,
+              title: { en: `New offer: ${offer.title.en}`, ar: `\u0639\u0631\u0636 \u062C\u062F\u064A\u062F: ${offer.title.ar}` },
+              body: {
+                en: "New savings are now live on NileLink Marketplace.",
+                ar: "\u062A\u0645 \u062A\u0641\u0639\u064A\u0644 \u0639\u0631\u0636 \u062A\u0648\u0641\u064A\u0631 \u062C\u062F\u064A\u062F \u0627\u0644\u0622\u0646 \u0639\u0644\u0649 \u0633\u0648\u0642 \u0646\u0627\u064A\u0644 \u0644\u064A\u0646\u0643."
+              },
+              actionUrl: offer.targetType === "category" && offer.targetId ? `/catalog?category=${encodeURIComponent(offer.targetId)}` : "/catalog?deals=true"
+            });
+          }
+          return;
+        }
+        const calcNewPrice = (baseCents) => {
+          if (offer.offerType === "fixed_usd_cents") {
+            return Math.max(1, baseCents - offer.discountValue);
+          }
+          return Math.max(1, Math.round(baseCents * (100 - offer.discountValue) / 100));
+        };
+        if (offer.targetType === "product" && offer.targetId) {
+          const prod = await txOrDb.queryOne(
+            "SELECT id, base_price_usd_cents FROM products WHERE id = ? AND deleted_at IS NULL AND published = 1",
+            [offer.targetId]
+          );
+          if (prod) {
+            await this.notifyWishlistPriceDrop(txOrDb, {
+              productId: prod.id,
+              oldPriceUsdCents: Number(prod.base_price_usd_cents),
+              newPriceUsdCents: calcNewPrice(Number(prod.base_price_usd_cents)),
+              offerTitle: offer.title
+            });
+          }
+        } else if (offer.targetType === "seller" && offer.targetId) {
+          const wishedProds = await txOrDb.query(
+            `SELECT DISTINCT p.id, p.base_price_usd_cents
+         FROM products p
+         INNER JOIN wishlists w ON w.product_id = p.id
+         WHERE p.seller_id = ? AND p.deleted_at IS NULL AND p.published = 1
+         LIMIT 100`,
+            [offer.targetId]
+          );
+          for (const wp of wishedProds) {
+            await this.notifyWishlistPriceDrop(txOrDb, {
+              productId: wp.id,
+              oldPriceUsdCents: Number(wp.base_price_usd_cents),
+              newPriceUsdCents: calcNewPrice(Number(wp.base_price_usd_cents)),
+              offerTitle: offer.title
+            });
+          }
+        } else {
+          const labelOff = offer.offerType === "fixed_usd_cents" ? `$${(offer.discountValue / 100).toFixed(2)} OFF` : `${offer.discountValue}% OFF`;
+          await this.notifyPromotionalOfferFanout(txOrDb, {
+            entityType: "offer",
+            entityId: offer.id,
+            title: { en: `${offer.title.en} \xB7 ${labelOff}`, ar: `${offer.title.ar} \xB7 \u062E\u0635\u0645 ${labelOff}` },
+            body: {
+              en: `Limited-time promotional offer is now active across eligible NileLink items.`,
+              ar: `\u0639\u0631\u0636 \u062A\u0631\u0648\u064A\u062C\u064A \u0644\u0641\u062A\u0631\u0629 \u0645\u062D\u062F\u0648\u062F\u0629 \u0645\u062A\u0627\u062D \u0627\u0644\u0622\u0646 \u0639\u0644\u0649 \u0627\u0644\u0645\u0646\u062A\u062C\u0627\u062A \u0627\u0644\u0645\u0624\u0647\u0644\u0629 \u0641\u064A \u0646\u0627\u064A\u0644 \u0644\u064A\u0646\u0643.`
+            },
+            actionUrl: offer.targetType === "category" && offer.targetId ? `/catalog?category=${encodeURIComponent(offer.targetId)}` : "/catalog?deals=true"
+          });
+        }
+      }
+      async dispatchFlashSaleNotifications(txOrDb, flashSale) {
+        for (const item of flashSale.items) {
+          if (item.basePriceUsdCents && item.salePriceUsdCents < item.basePriceUsdCents) {
+            await this.notifyWishlistPriceDrop(txOrDb, {
+              productId: item.productId,
+              oldPriceUsdCents: item.basePriceUsdCents,
+              newPriceUsdCents: item.salePriceUsdCents,
+              offerTitle: flashSale.title
+            });
+          }
+        }
+        await this.notifyPromotionalOfferFanout(txOrDb, {
+          entityType: "flash_sale",
+          entityId: flashSale.id,
+          title: { en: `Flash Sale Live: ${flashSale.title.en}`, ar: `\u0639\u0631\u0636 \u062E\u0627\u0637\u0641 \u0645\u0628\u0627\u0634\u0631: ${flashSale.title.ar}` },
+          body: {
+            en: `${flashSale.items.length} curated item(s) discounted with limited stock caps.`,
+            ar: `${flashSale.items.length} \u0645\u0646\u062A\u062C\u0627\u062A \u0645\u062E\u062A\u0627\u0631\u0629 \u0628\u062E\u0635\u0648\u0645\u0627\u062A \u062D\u0635\u0631\u064A\u0629 \u0648\u0643\u0645\u064A\u0627\u062A \u0645\u062D\u062F\u0648\u062F\u0629.`
+          },
+          actionUrl: "/catalog?deals=true"
+        });
       }
       async getUserNotifications(userId) {
-        const rows = await this.db.query("SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 60", [userId]);
+        const rows = await this.db.query("SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 80", [userId]);
         return rows.map((r) => ({
           id: r.id,
           userId: r.user_id,
+          category: r.category || "system",
           title: parseJson(r.title_json, { en: "", ar: "" }),
           body: parseJson(r.body_json, { en: "", ar: "" }),
+          actionUrl: r.action_url ? String(r.action_url) : null,
+          metadata: r.metadata_json ? parseJson(r.metadata_json, null) : null,
+          emailedAt: r.emailed_at ? String(r.emailed_at) : null,
           readAt: r.read_at ? String(r.read_at) : null,
           createdAt: String(r.created_at)
         }));
@@ -7801,6 +8933,121 @@ var init_marketplaceRepo = __esm({
           [now, idOrAll, userId]
         );
         return { updated: res.affectedRows };
+      }
+      async requestPasswordResetOtp(input, ipAddress) {
+        const rawIdentifier = (input.identifier || input.email || "").trim();
+        if (!rawIdentifier || rawIdentifier.length < 3) {
+          throw new Error("Email or phone number is required.");
+        }
+        const requestedUiChannel = input.channel === "sms" || !input.channel && !rawIdentifier.includes("@") ? "sms" : "email";
+        const dbChannel = requestedUiChannel === "sms" ? "phone" : "email";
+        const user = await this.findUserByIdentifier(rawIdentifier);
+        if (!user || user.deleted_at || user.is_blocked) {
+          return {
+            ok: true,
+            channel: requestedUiChannel,
+            deliveryConfigured: true,
+            expiresInSeconds: 600
+          };
+        }
+        const target = dbChannel === "email" ? user.email : user.phone;
+        if (!target || !target.trim()) {
+          return {
+            ok: true,
+            channel: requestedUiChannel,
+            deliveryConfigured: true,
+            expiresInSeconds: 600
+          };
+        }
+        const locale = user.preferred_locale === "ar" ? "ar" : "en";
+        const dispatched = await this.db.transaction(async (tx) => {
+          const res = await this.dispatchOtpChallenge(tx, {
+            userId: user.id,
+            userName: user.name,
+            channel: dbChannel,
+            target,
+            purpose: "password_reset_otp",
+            locale
+          });
+          await writeAuditLog(tx, {
+            actorUserId: user.id,
+            action: `auth.password_reset_otp_requested.${dbChannel}`,
+            entityType: "user",
+            entityId: user.id,
+            ipAddress
+          });
+          return res;
+        });
+        const isDevOrTest = process.env.NODE_ENV !== "production";
+        return {
+          ok: true,
+          channel: requestedUiChannel,
+          deliveryConfigured: dispatched.deliveryConfigured,
+          expiresInSeconds: 600,
+          ...isDevOrTest && !dispatched.deliveryConfigured ? { devOtpCode: dispatched.code } : {}
+        };
+      }
+      async verifyPasswordResetOtp(input, ipAddress) {
+        const rawIdentifier = input.identifier.trim();
+        const cleanCode = input.code.replace(/\s+/g, "");
+        if (!/^\d{6}$/.test(cleanCode)) {
+          throw new Error("Please enter the 6-digit reset verification code.");
+        }
+        const user = await this.findUserByIdentifier(rawIdentifier);
+        if (!user || user.deleted_at || user.is_blocked) {
+          throw new Error("Invalid or expired verification code.");
+        }
+        const dbChannel = input.channel === "sms" || !input.channel && !rawIdentifier.includes("@") ? "phone" : "email";
+        const now = toSqlTimestamp();
+        const txRes = await this.db.transaction(async (tx) => {
+          const challenge = await tx.queryOne(
+            `SELECT id, code_hash, attempts, expires_at
+         FROM verification_codes
+         WHERE user_id = ? AND channel = ? AND purpose = 'password_reset_otp' AND consumed_at IS NULL
+         ORDER BY created_at DESC LIMIT 1`,
+            [user.id, dbChannel]
+          );
+          if (!challenge || String(challenge.expires_at) <= now) {
+            throw new Error("Reset verification code expired or not found. Request a new OTP.");
+          }
+          if (Number(challenge.attempts) >= 5) {
+            throw new Error("Too many failed verification attempts. Please request a new OTP code.");
+          }
+          const submittedHash = hashOtpCode(user.id, dbChannel, "password_reset_otp", cleanCode);
+          if (!timingSafeStringMatch(challenge.code_hash, submittedHash)) {
+            await tx.execute("UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?", [challenge.id]);
+            return { failed: true, message: "Invalid 6-digit verification code." };
+          }
+          await tx.execute("UPDATE verification_codes SET consumed_at = ? WHERE id = ?", [now, challenge.id]);
+          const rawResetToken = crypto5.randomBytes(24).toString("hex");
+          const tokenHash = sha256Hex(rawResetToken);
+          const resetExpiresAt = toSqlTimestamp(new Date(Date.now() + 15 * 6e4));
+          await tx.execute(
+            `UPDATE password_resets SET used_at = ? WHERE user_id = ? AND purpose = 'password_reset' AND used_at IS NULL`,
+            [now, user.id]
+          );
+          await tx.execute(
+            `INSERT INTO password_resets (id, user_id, token_hash, purpose, expires_at, used_at, created_at)
+         VALUES (?, ?, ?, 'password_reset', ?, NULL, ?)`,
+            [`pwr-${crypto5.randomUUID()}`, user.id, tokenHash, resetExpiresAt, now]
+          );
+          await writeAuditLog(tx, {
+            actorUserId: user.id,
+            action: `auth.password_reset_otp_verified.${dbChannel}`,
+            entityType: "user",
+            entityId: user.id,
+            ipAddress
+          });
+          return { failed: false, resetToken: rawResetToken };
+        });
+        if (txRes.failed) {
+          throw new Error(txRes.message);
+        }
+        return {
+          ok: true,
+          resetToken: txRes.resetToken,
+          expiresInSeconds: 900
+        };
       }
       async requestPasswordReset(email, ipAddress) {
         const emailNorm = email.trim().toLowerCase();
@@ -8336,6 +9583,14 @@ var init_marketplaceRepo = __esm({
             after: { titleEn: nextTitle.en, basePriceUsdCents: patch.basePriceUsdCents },
             ipAddress
           });
+          const prevPrice = Number(existing.base_price_usd_cents);
+          if (patch.basePriceUsdCents !== void 0 && patch.basePriceUsdCents < prevPrice) {
+            await this.notifyWishlistPriceDrop(tx, {
+              productId,
+              oldPriceUsdCents: prevPrice,
+              newPriceUsdCents: patch.basePriceUsdCents
+            });
+          }
           const updated = await tx.queryOne("SELECT * FROM products WHERE id = ?", [productId]);
           const [mapped] = await this.mapProductRows([updated], tx);
           return mapped;
@@ -9095,23 +10350,48 @@ var init_marketplaceRepo = __esm({
       }
       async adminUpdateUserAccess(userId, actorUserId, patch, ipAddress) {
         return this.db.transaction(async (tx) => {
+          const actor = await tx.queryOne("SELECT role_key FROM users WHERE id = ?", [actorUserId]);
           const target = await tx.queryOne(
-            "SELECT id, role_key, is_blocked FROM users WHERE id = ? AND deleted_at IS NULL",
+            "SELECT id, role_key, is_blocked, email_verified_at, phone_verified_at FROM users WHERE id = ? AND deleted_at IS NULL",
             [userId]
           );
           if (!target) throw new Error("User not found.");
           if (target.role_key === "admin_super" && patch.isBlocked) {
-            throw new Error("Cannot block a Super Admin account.");
+            throw new Error("Cannot deactivate or block a Super Admin account.");
+          }
+          const now = toSqlTimestamp();
+          if (patch.roleKey !== void 0 && patch.roleKey !== target.role_key) {
+            if (target.role_key === "admin_super") {
+              throw new Error("Super Admin role cannot be reassigned.");
+            }
+            if (actor?.role_key !== "admin_super") {
+              throw new Error("Only Super Admin can change user roles.");
+            }
+            await tx.execute("UPDATE users SET role_key = ?, updated_at = ? WHERE id = ?", [patch.roleKey, now, userId]);
           }
           if (patch.isBlocked !== void 0) {
             await tx.execute("UPDATE users SET is_blocked = ?, updated_at = ? WHERE id = ?", [
               patch.isBlocked ? 1 : 0,
-              toSqlTimestamp(),
+              now,
               userId
             ]);
             if (patch.isBlocked) {
               await tx.execute("DELETE FROM sessions WHERE user_id = ?", [userId]);
             }
+          }
+          if (patch.verifyEmail !== void 0) {
+            await tx.execute("UPDATE users SET email_verified_at = ?, updated_at = ? WHERE id = ?", [
+              patch.verifyEmail ? now : null,
+              now,
+              userId
+            ]);
+          }
+          if (patch.verifyPhone !== void 0) {
+            await tx.execute("UPDATE users SET phone_verified_at = ?, updated_at = ? WHERE id = ?", [
+              patch.verifyPhone ? now : null,
+              now,
+              userId
+            ]);
           }
           if (patch.permissions !== void 0) {
             await tx.execute("DELETE FROM user_permissions WHERE user_id = ?", [userId]);
@@ -9123,16 +10403,393 @@ var init_marketplaceRepo = __esm({
               ]);
             }
           }
+          const cleanedReason = patch.reason ? patch.reason.trim().slice(0, 300) : void 0;
           await writeAuditLog(tx, {
             actorUserId,
-            action: "admin.update_user_access",
+            action: patch.isBlocked === true ? "admin.deactivate_user" : patch.isBlocked === false ? "admin.reactivate_user" : "admin.update_user_access",
             entityType: "user",
             entityId: userId,
-            after: patch,
+            before: {
+              roleKey: target.role_key,
+              isBlocked: Boolean(target.is_blocked),
+              emailVerified: Boolean(target.email_verified_at),
+              phoneVerified: Boolean(target.phone_verified_at)
+            },
+            after: { ...patch, ...cleanedReason ? { reason: cleanedReason } : {} },
             ipAddress
           });
-          return { ok: true, userId };
+          const refreshed = await tx.queryOne("SELECT is_blocked, email_verified_at, phone_verified_at FROM users WHERE id = ?", [userId]);
+          const emailVerifiedAt = refreshed?.email_verified_at ? String(refreshed.email_verified_at) : null;
+          const phoneVerifiedAt = refreshed?.phone_verified_at ? String(refreshed.phone_verified_at) : null;
+          return {
+            ok: true,
+            userId,
+            isBlocked: Boolean(refreshed?.is_blocked),
+            emailVerifiedAt,
+            phoneVerifiedAt,
+            isFullyVerified: Boolean(emailVerifiedAt && phoneVerifiedAt)
+          };
         });
+      }
+      async getAdminUserActivity(userId) {
+        const userRow = await this.db.queryOne(
+          `SELECT id, name, email, phone, role_key, is_blocked, totp_enabled,
+              email_verified_at, phone_verified_at, preferred_locale, preferred_currency,
+              failed_login_attempts, locked_until, created_at, updated_at
+       FROM users WHERE id = ? AND deleted_at IS NULL LIMIT 1`,
+          [userId]
+        );
+        if (!userRow) throw new Error("User not found.");
+        const [
+          permRows,
+          sellerRow,
+          orderAgg,
+          recentOrderRows,
+          recentReviewRows,
+          reviewCntRow,
+          recentTicketRows,
+          ticketCntRow,
+          sessionCntRow,
+          auditRows
+        ] = await Promise.all([
+          this.db.query("SELECT permission_key FROM user_permissions WHERE user_id = ?", [userId]),
+          this.db.queryOne(
+            `SELECT sel.id, sel.status, sel.verified, st.slug, st.name_json
+         FROM sellers sel INNER JOIN stores st ON st.seller_id = sel.id
+         WHERE sel.owner_user_id = ? AND sel.deleted_at IS NULL LIMIT 1`,
+            [userId]
+          ),
+          this.db.queryOne(
+            "SELECT COUNT(*) AS cnt, COALESCE(SUM(grand_total_usd_cents), 0) AS total_spent FROM orders WHERE user_id = ?",
+            [userId]
+          ),
+          this.db.query(
+            "SELECT id, order_number, grand_total_usd_cents, payment_method, payment_status, created_at FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 15",
+            [userId]
+          ),
+          this.db.query(
+            "SELECT id, product_id, rating, comment, moderation_status, created_at FROM reviews WHERE user_id = ? ORDER BY created_at DESC LIMIT 10",
+            [userId]
+          ),
+          this.db.queryOne("SELECT COUNT(*) AS cnt FROM reviews WHERE user_id = ?", [userId]),
+          this.db.query(
+            "SELECT id, subject, status, created_at FROM support_tickets WHERE user_id = ? ORDER BY created_at DESC LIMIT 10",
+            [userId]
+          ),
+          this.db.queryOne("SELECT COUNT(*) AS cnt FROM support_tickets WHERE user_id = ?", [userId]),
+          this.db.queryOne("SELECT COUNT(*) AS cnt FROM sessions WHERE user_id = ?", [userId]),
+          this.db.query(
+            `SELECT * FROM audit_log
+         WHERE actor_user_id = ? OR (entity_type = 'user' AND entity_id = ?)
+         ORDER BY created_at DESC LIMIT 80`,
+            [userId, userId]
+          )
+        ]);
+        const emailVerifiedAt = userRow.email_verified_at ? String(userRow.email_verified_at) : null;
+        const phoneVerifiedAt = userRow.phone_verified_at ? String(userRow.phone_verified_at) : null;
+        const auditEvents = auditRows.map((a) => ({
+          id: String(a.id),
+          actorUserId: a.actor_user_id ? String(a.actor_user_id) : null,
+          action: String(a.action),
+          entityType: String(a.entity_type),
+          entityId: String(a.entity_id),
+          beforeJson: a.before_json ? String(a.before_json) : null,
+          afterJson: a.after_json ? String(a.after_json) : null,
+          ipAddress: a.ip_address ? String(a.ip_address) : null,
+          createdAt: String(a.created_at)
+        }));
+        return {
+          user: {
+            id: userRow.id,
+            name: userRow.name,
+            email: userRow.email,
+            phone: userRow.phone,
+            roleKey: userRow.role_key,
+            isBlocked: Boolean(userRow.is_blocked),
+            totpEnabled: Boolean(userRow.totp_enabled),
+            emailVerifiedAt,
+            phoneVerifiedAt,
+            isFullyVerified: Boolean(emailVerifiedAt && phoneVerifiedAt),
+            permissions: permRows.map((p) => p.permission_key),
+            ordersCount: Number(orderAgg?.cnt ?? 0),
+            activeSessionsCount: Number(sessionCntRow?.cnt ?? 0),
+            sellerId: sellerRow?.id ?? null,
+            sellerName: sellerRow ? parseJson(sellerRow.name_json, { en: sellerRow.slug, ar: sellerRow.slug }).en : null,
+            lastActivityAt: auditEvents[0]?.createdAt ?? String(userRow.updated_at),
+            createdAt: String(userRow.created_at),
+            preferredLocale: userRow.preferred_locale === "ar" ? "ar" : "en",
+            preferredCurrency: userRow.preferred_currency === "LBP" ? "LBP" : "USD",
+            failedLoginAttempts: Number(userRow.failed_login_attempts ?? 0),
+            lockedUntil: userRow.locked_until ? String(userRow.locked_until) : null,
+            updatedAt: String(userRow.updated_at),
+            seller: sellerRow ? {
+              id: sellerRow.id,
+              slug: sellerRow.slug,
+              name: parseJson(sellerRow.name_json, { en: sellerRow.slug, ar: sellerRow.slug }),
+              status: sellerRow.status,
+              verified: Boolean(sellerRow.verified)
+            } : null
+          },
+          stats: {
+            ordersCount: Number(orderAgg?.cnt ?? 0),
+            totalSpentUsdCents: Number(orderAgg?.total_spent ?? 0),
+            reviewsCount: Number(reviewCntRow?.cnt ?? 0),
+            ticketsCount: Number(ticketCntRow?.cnt ?? 0),
+            activeSessionsCount: Number(sessionCntRow?.cnt ?? 0),
+            auditEventsCount: auditEvents.length
+          },
+          recentOrders: recentOrderRows.map((o) => ({
+            id: o.id,
+            orderNumber: o.order_number,
+            grandTotalUsdCents: Number(o.grand_total_usd_cents),
+            paymentMethod: o.payment_method,
+            paymentStatus: o.payment_status,
+            createdAt: String(o.created_at)
+          })),
+          recentReviews: recentReviewRows.map((rv) => ({
+            id: rv.id,
+            productId: rv.product_id,
+            rating: Number(rv.rating),
+            comment: rv.comment,
+            moderationStatus: rv.moderation_status,
+            createdAt: String(rv.created_at)
+          })),
+          recentTickets: recentTicketRows.map((tk) => ({
+            id: tk.id,
+            subject: tk.subject,
+            status: tk.status,
+            createdAt: String(tk.created_at)
+          })),
+          auditEvents
+        };
+      }
+      // --- Customer <-> Store Owner System Chat ---
+      mapChatConversationRow(r) {
+        return {
+          id: String(r.id),
+          sellerId: String(r.seller_id),
+          sellerName: parseJson(r.seller_name_json, {
+            en: String(r.seller_legal_name || "Store"),
+            ar: String(r.seller_legal_name || "\u0627\u0644\u0645\u062A\u062C\u0631")
+          }),
+          sellerSlug: String(r.seller_slug || ""),
+          customerUserId: String(r.customer_user_id),
+          customerName: String(r.customer_name),
+          productId: r.product_id ? String(r.product_id) : null,
+          productTitle: r.product_title_json ? parseJson(r.product_title_json, null) : null,
+          status: String(r.status || "open") === "closed" ? "closed" : "open",
+          unreadForSeller: Number(r.unread_for_seller || 0),
+          unreadForCustomer: Number(r.unread_for_customer || 0),
+          lastMessagePreview: r.last_message_preview ? String(r.last_message_preview) : void 0,
+          lastMessageAt: String(r.last_message_at),
+          createdAt: String(r.created_at)
+        };
+      }
+      assertChatParticipant(conv, user) {
+        if (conv.customer_user_id === user.id) return;
+        if (user.sellerId && conv.seller_id === user.sellerId) return;
+        if (isAdminRole(user.roleKey)) return;
+        throw new Error("Forbidden: you do not have access to this conversation.");
+      }
+      async listChatConversations(user, sellerFilterId) {
+        const baseSelect = `
+      SELECT c.*, st.name_json AS seller_name_json, st.slug AS seller_slug, sel.legal_name AS seller_legal_name,
+             p.title_json AS product_title_json
+      FROM chat_conversations c
+      INNER JOIN sellers sel ON sel.id = c.seller_id
+      INNER JOIN stores st ON st.seller_id = c.seller_id
+      LEFT JOIN products p ON p.id = c.product_id
+    `;
+        let rows;
+        if (isAdminRole(user.roleKey) && sellerFilterId) {
+          rows = await this.db.query(
+            `${baseSelect} WHERE c.seller_id = ? ORDER BY c.last_message_at DESC LIMIT 80`,
+            [sellerFilterId]
+          );
+        } else if (user.sellerId && (!sellerFilterId || sellerFilterId === user.sellerId)) {
+          rows = await this.db.query(
+            `${baseSelect} WHERE c.seller_id = ? OR c.customer_user_id = ? ORDER BY c.last_message_at DESC LIMIT 80`,
+            [user.sellerId, user.id]
+          );
+        } else {
+          rows = await this.db.query(
+            `${baseSelect} WHERE c.customer_user_id = ? ORDER BY c.last_message_at DESC LIMIT 80`,
+            [user.id]
+          );
+        }
+        return rows.map((r) => this.mapChatConversationRow(r));
+      }
+      async startOrSendChatConversation(user, input) {
+        const cleanBody = input.body.trim();
+        if (!cleanBody) throw new Error("Message text is required.");
+        if (user.sellerId && user.sellerId === input.sellerId) {
+          throw new Error("You cannot start a customer inquiry with your own storefront.");
+        }
+        const seller = await this.db.queryOne(
+          "SELECT id FROM sellers WHERE id = ? AND status = 'approved' AND deleted_at IS NULL",
+          [input.sellerId]
+        );
+        if (!seller) throw new Error("Storefront not found or unavailable.");
+        const cleanProdId = input.productId?.trim() || null;
+        if (cleanProdId) {
+          const prod = await this.db.queryOne(
+            "SELECT id FROM products WHERE id = ? AND seller_id = ? AND deleted_at IS NULL",
+            [cleanProdId, input.sellerId]
+          );
+          if (!prod) throw new Error("Product does not belong to this storefront.");
+        }
+        const now = toSqlTimestamp();
+        const preview = cleanBody.slice(0, 180);
+        return this.db.transaction(async (tx) => {
+          let existing = await tx.queryOne(
+            cleanProdId ? "SELECT id FROM chat_conversations WHERE seller_id = ? AND customer_user_id = ? AND product_id = ? LIMIT 1" : "SELECT id FROM chat_conversations WHERE seller_id = ? AND customer_user_id = ? AND product_id IS NULL LIMIT 1",
+            cleanProdId ? [input.sellerId, user.id, cleanProdId] : [input.sellerId, user.id]
+          );
+          let convId = existing?.id;
+          if (!convId) {
+            convId = `cht-${crypto5.randomUUID()}`;
+            await tx.execute(
+              `INSERT INTO chat_conversations
+             (id, seller_id, customer_user_id, customer_name, product_id, status, unread_for_seller, unread_for_customer, last_message_preview, last_message_at, created_at)
+           VALUES (?, ?, ?, ?, ?, 'open', 1, 0, ?, ?, ?)`,
+              [convId, input.sellerId, user.id, user.name, cleanProdId, preview, now, now]
+            );
+          } else {
+            await tx.execute(
+              `UPDATE chat_conversations
+           SET status = 'open', unread_for_seller = unread_for_seller + 1, last_message_preview = ?, last_message_at = ?
+           WHERE id = ?`,
+              [preview, now, convId]
+            );
+          }
+          const msgId = `msg-${crypto5.randomUUID()}`;
+          await tx.execute(
+            `INSERT INTO chat_messages (id, conversation_id, sender_role, sender_user_id, body, read_at, created_at)
+         VALUES (?, ?, 'customer', ?, ?, NULL, ?)`,
+            [msgId, convId, user.id, cleanBody, now]
+          );
+          const convRow = await tx.queryOne(
+            `SELECT c.*, st.name_json AS seller_name_json, st.slug AS seller_slug, sel.legal_name AS seller_legal_name,
+                p.title_json AS product_title_json
+         FROM chat_conversations c
+         INNER JOIN sellers sel ON sel.id = c.seller_id
+         INNER JOIN stores st ON st.seller_id = c.seller_id
+         LEFT JOIN products p ON p.id = c.product_id
+         WHERE c.id = ? LIMIT 1`,
+            [convId]
+          );
+          return {
+            conversation: this.mapChatConversationRow(convRow),
+            message: {
+              id: msgId,
+              conversationId: convId,
+              senderRole: "customer",
+              senderUserId: user.id,
+              body: cleanBody,
+              readAt: null,
+              createdAt: now
+            }
+          };
+        });
+      }
+      async getChatConversationMessages(conversationId, user) {
+        const convRow = await this.db.queryOne(
+          `SELECT c.*, st.name_json AS seller_name_json, st.slug AS seller_slug, sel.legal_name AS seller_legal_name,
+              p.title_json AS product_title_json
+       FROM chat_conversations c
+       INNER JOIN sellers sel ON sel.id = c.seller_id
+       INNER JOIN stores st ON st.seller_id = c.seller_id
+       LEFT JOIN products p ON p.id = c.product_id
+       WHERE c.id = ? LIMIT 1`,
+          [conversationId]
+        );
+        if (!convRow) throw new Error("Conversation not found.");
+        const conv = this.mapChatConversationRow(convRow);
+        this.assertChatParticipant({ customer_user_id: conv.customerUserId, seller_id: conv.sellerId }, user);
+        const now = toSqlTimestamp();
+        if (conv.customerUserId === user.id && conv.unreadForCustomer > 0) {
+          await this.db.execute("UPDATE chat_conversations SET unread_for_customer = 0 WHERE id = ?", [conversationId]);
+          await this.db.execute(
+            "UPDATE chat_messages SET read_at = ? WHERE conversation_id = ? AND sender_role != 'customer' AND read_at IS NULL",
+            [now, conversationId]
+          );
+          conv.unreadForCustomer = 0;
+        } else if (user.sellerId && conv.sellerId === user.sellerId && conv.unreadForSeller > 0) {
+          await this.db.execute("UPDATE chat_conversations SET unread_for_seller = 0 WHERE id = ?", [conversationId]);
+          await this.db.execute(
+            "UPDATE chat_messages SET read_at = ? WHERE conversation_id = ? AND sender_role = 'customer' AND read_at IS NULL",
+            [now, conversationId]
+          );
+          conv.unreadForSeller = 0;
+        }
+        const msgRows = await this.db.query(
+          "SELECT * FROM chat_messages WHERE conversation_id = ? ORDER BY created_at ASC LIMIT 200",
+          [conversationId]
+        );
+        const messages = msgRows.map((m) => ({
+          id: String(m.id),
+          conversationId: String(m.conversation_id),
+          senderRole: String(m.sender_role),
+          senderUserId: String(m.sender_user_id),
+          body: String(m.body),
+          readAt: m.read_at ? String(m.read_at) : null,
+          createdAt: String(m.created_at)
+        }));
+        return { conversation: conv, messages };
+      }
+      async sendChatMessage(conversationId, user, body) {
+        const cleanBody = body.trim();
+        if (!cleanBody) throw new Error("Message text is required.");
+        const conv = await this.db.queryOne(
+          "SELECT id, seller_id, customer_user_id FROM chat_conversations WHERE id = ?",
+          [conversationId]
+        );
+        if (!conv) throw new Error("Conversation not found.");
+        this.assertChatParticipant(conv, user);
+        const senderRole = user.sellerId && conv.seller_id === user.sellerId || isAdminRole(user.roleKey) && conv.customer_user_id !== user.id ? "seller" : "customer";
+        const now = toSqlTimestamp();
+        const preview = cleanBody.slice(0, 180);
+        const msgId = `msg-${crypto5.randomUUID()}`;
+        await this.db.transaction(async (tx) => {
+          await tx.execute(
+            `INSERT INTO chat_messages (id, conversation_id, sender_role, sender_user_id, body, read_at, created_at)
+         VALUES (?, ?, ?, ?, ?, NULL, ?)`,
+            [msgId, conversationId, senderRole, user.id, cleanBody, now]
+          );
+          if (senderRole === "customer") {
+            await tx.execute(
+              `UPDATE chat_conversations
+           SET status = 'open', unread_for_seller = unread_for_seller + 1, last_message_preview = ?, last_message_at = ?
+           WHERE id = ?`,
+              [preview, now, conversationId]
+            );
+          } else {
+            await tx.execute(
+              `UPDATE chat_conversations
+           SET status = 'open', unread_for_customer = unread_for_customer + 1, last_message_preview = ?, last_message_at = ?
+           WHERE id = ?`,
+              [preview, now, conversationId]
+            );
+          }
+        });
+        return {
+          id: msgId,
+          conversationId,
+          senderRole,
+          senderUserId: user.id,
+          body: cleanBody,
+          readAt: null,
+          createdAt: now
+        };
+      }
+      async updateChatConversationStatus(conversationId, user, status) {
+        const conv = await this.db.queryOne(
+          "SELECT id, seller_id, customer_user_id FROM chat_conversations WHERE id = ?",
+          [conversationId]
+        );
+        if (!conv) throw new Error("Conversation not found.");
+        this.assertChatParticipant(conv, user);
+        await this.db.execute("UPDATE chat_conversations SET status = ? WHERE id = ?", [status, conversationId]);
       }
       async releaseHoldsNow(actorUserId, ipAddress) {
         const released = await releaseEligibleEscrowHolds(this.db);
@@ -9193,6 +10850,8 @@ __export(schema_exports, {
   cartItems: () => cartItems,
   carts: () => carts,
   categories: () => categories,
+  chatConversations: () => chatConversations,
+  chatMessages: () => chatMessages,
   commissionsLog: () => commissionsLog,
   couponRedemptions: () => couponRedemptions,
   coupons: () => coupons,
@@ -9217,6 +10876,7 @@ __export(schema_exports, {
   media: () => media,
   menus: () => menus,
   newsletterSubscribers: () => newsletterSubscribers,
+  notificationPreferences: () => notificationPreferences,
   notifications: () => notifications,
   offers: () => offers,
   orderItems: () => orderItems,
@@ -9246,6 +10906,7 @@ __export(schema_exports, {
   translations: () => translations,
   userPermissions: () => userPermissions,
   users: () => users,
+  verificationCodes: () => verificationCodes,
   wishlists: () => wishlists
 });
 import {
@@ -9940,10 +11601,24 @@ var addresses = mysqlTable("addresses", {
 var notifications = mysqlTable("notifications", {
   id: varchar("id", { length: 64 }).primaryKey(),
   userId: varchar("user_id", { length: 64 }).notNull(),
+  category: varchar("category", { length: 32 }).notNull().default("system"),
   titleJson: json("title_json").$type().notNull(),
   bodyJson: json("body_json").$type().notNull(),
+  actionUrl: varchar("action_url", { length: 255 }),
+  metadataJson: json("metadata_json").$type(),
+  emailedAt: timestamp("emailed_at"),
   readAt: timestamp("read_at"),
   createdAt: timestamp("created_at").notNull().defaultNow()
+});
+var notificationPreferences = mysqlTable("notification_preferences", {
+  userId: varchar("user_id", { length: 64 }).primaryKey(),
+  emailSummaryEnabled: boolean("email_summary_enabled").notNull().default(true),
+  summaryFrequency: varchar("summary_frequency", { length: 16 }).notNull().default("daily"),
+  orderUpdates: boolean("order_updates").notNull().default(true),
+  priceDrops: boolean("price_drops").notNull().default(true),
+  promotionalOffers: boolean("promotional_offers").notNull().default(true),
+  lastSummarySentAt: timestamp("last_summary_sent_at"),
+  updatedAt: timestamp("updated_at").notNull().defaultNow()
 });
 var emailTemplates = mysqlTable("email_templates", {
   key: varchar("key", { length: 64 }).primaryKey(),
@@ -10078,6 +11753,57 @@ var automationExecutions = mysqlTable(
   },
   (t) => [uniqueIndex("uq_automation_flow_dedup").on(t.flowId, t.dedupKey)]
 );
+var verificationCodes = mysqlTable(
+  "verification_codes",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    userId: varchar("user_id", { length: 64 }).notNull(),
+    channel: varchar("channel", { length: 16 }).notNull(),
+    // 'email' | 'phone'
+    target: varchar("target", { length: 190 }).notNull(),
+    purpose: varchar("purpose", { length: 32 }).notNull().default("verify_contact"),
+    codeHash: varchar("code_hash", { length: 128 }).notNull(),
+    attempts: int("attempts").notNull().default(0),
+    expiresAt: timestamp("expires_at").notNull(),
+    consumedAt: timestamp("consumed_at"),
+    createdAt: timestamp("created_at").notNull().defaultNow()
+  },
+  (t) => [index("idx_verif_user_channel").on(t.userId, t.channel)]
+);
+var chatConversations = mysqlTable(
+  "chat_conversations",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    sellerId: varchar("seller_id", { length: 64 }).notNull(),
+    customerUserId: varchar("customer_user_id", { length: 64 }).notNull(),
+    customerName: varchar("customer_name", { length: 160 }).notNull(),
+    productId: varchar("product_id", { length: 64 }),
+    status: varchar("status", { length: 24 }).notNull().default("open"),
+    unreadForSeller: int("unread_for_seller").notNull().default(0),
+    unreadForCustomer: int("unread_for_customer").notNull().default(0),
+    lastMessagePreview: varchar("last_message_preview", { length: 240 }),
+    lastMessageAt: timestamp("last_message_at").notNull().defaultNow(),
+    createdAt: timestamp("created_at").notNull().defaultNow()
+  },
+  (t) => [
+    index("idx_chat_conv_seller").on(t.sellerId),
+    index("idx_chat_conv_customer").on(t.customerUserId)
+  ]
+);
+var chatMessages = mysqlTable(
+  "chat_messages",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    conversationId: varchar("conversation_id", { length: 64 }).notNull(),
+    senderRole: varchar("sender_role", { length: 24 }).notNull(),
+    // 'customer' | 'seller' | 'admin'
+    senderUserId: varchar("sender_user_id", { length: 64 }).notNull(),
+    body: text("body").notNull(),
+    readAt: timestamp("read_at"),
+    createdAt: timestamp("created_at").notNull().defaultNow()
+  },
+  (t) => [index("idx_chat_msg_conv").on(t.conversationId)]
+);
 
 // server/db/client.ts
 function getPersistentStorageDir() {
@@ -10119,6 +11845,76 @@ var MysqlClient = class {
     if (fs.existsSync(migrationsFolder)) {
       await migrate(orm, { migrationsFolder });
     }
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS verification_codes (
+        id VARCHAR(64) PRIMARY KEY,
+        user_id VARCHAR(64) NOT NULL,
+        channel VARCHAR(16) NOT NULL,
+        target VARCHAR(190) NOT NULL,
+        purpose VARCHAR(32) NOT NULL DEFAULT 'verify_contact',
+        code_hash VARCHAR(128) NOT NULL,
+        attempts INT NOT NULL DEFAULT 0,
+        expires_at TIMESTAMP NOT NULL,
+        consumed_at TIMESTAMP NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_verif_user_channel (user_id, channel)
+      )
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS chat_conversations (
+        id VARCHAR(64) PRIMARY KEY,
+        seller_id VARCHAR(64) NOT NULL,
+        customer_user_id VARCHAR(64) NOT NULL,
+        customer_name VARCHAR(160) NOT NULL,
+        product_id VARCHAR(64) NULL,
+        status VARCHAR(24) NOT NULL DEFAULT 'open',
+        unread_for_seller INT NOT NULL DEFAULT 0,
+        unread_for_customer INT NOT NULL DEFAULT 0,
+        last_message_preview VARCHAR(240) NULL,
+        last_message_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_chat_conv_seller (seller_id),
+        INDEX idx_chat_conv_customer (customer_user_id)
+      )
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id VARCHAR(64) PRIMARY KEY,
+        conversation_id VARCHAR(64) NOT NULL,
+        sender_role VARCHAR(24) NOT NULL,
+        sender_user_id VARCHAR(64) NOT NULL,
+        body TEXT NOT NULL,
+        read_at TIMESTAMP NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_chat_msg_conv (conversation_id)
+      )
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS notification_preferences (
+        user_id VARCHAR(64) PRIMARY KEY,
+        email_summary_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        summary_frequency VARCHAR(16) NOT NULL DEFAULT 'daily',
+        order_updates BOOLEAN NOT NULL DEFAULT TRUE,
+        price_drops BOOLEAN NOT NULL DEFAULT TRUE,
+        promotional_offers BOOLEAN NOT NULL DEFAULT TRUE,
+        last_summary_sent_at TIMESTAMP NULL,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    const ensureMysqlCol = async (table, col, defSql) => {
+      const [rows] = await this.pool.execute(
+        `SELECT COUNT(*) AS cnt FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+        [table, col]
+      );
+      const list = rows;
+      if (!list[0] || Number(list[0].cnt) === 0) {
+        await this.pool.execute(`ALTER TABLE ${table} ADD COLUMN ${col} ${defSql}`);
+      }
+    };
+    await ensureMysqlCol("notifications", "category", "VARCHAR(32) NOT NULL DEFAULT 'system'");
+    await ensureMysqlCol("notifications", "action_url", "VARCHAR(255) NULL");
+    await ensureMysqlCol("notifications", "metadata_json", "JSON NULL");
+    await ensureMysqlCol("notifications", "emailed_at", "TIMESTAMP NULL");
   }
   async query(sql, params = []) {
     const [rows] = await this.pool.execute(sql, params);
@@ -10500,6 +12296,38 @@ var SqlitePreviewClient = class {
         recipient_email TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')),
         UNIQUE(flow_id, dedup_key)
       );
+      CREATE TABLE IF NOT EXISTS verification_codes (
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL, channel TEXT NOT NULL,
+        target TEXT NOT NULL, purpose TEXT NOT NULL DEFAULT 'verify_contact',
+        code_hash TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+        expires_at TEXT NOT NULL, consumed_at TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_verif_user_channel ON verification_codes(user_id, channel);
+      CREATE TABLE IF NOT EXISTS chat_conversations (
+        id TEXT PRIMARY KEY, seller_id TEXT NOT NULL, customer_user_id TEXT NOT NULL,
+        customer_name TEXT NOT NULL, product_id TEXT, status TEXT NOT NULL DEFAULT 'open',
+        unread_for_seller INTEGER NOT NULL DEFAULT 0, unread_for_customer INTEGER NOT NULL DEFAULT 0,
+        last_message_preview TEXT, last_message_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_chat_conv_seller ON chat_conversations(seller_id);
+      CREATE INDEX IF NOT EXISTS idx_chat_conv_customer ON chat_conversations(customer_user_id);
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, sender_role TEXT NOT NULL,
+        sender_user_id TEXT NOT NULL, body TEXT NOT NULL, read_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_chat_msg_conv ON chat_messages(conversation_id);
+      CREATE TABLE IF NOT EXISTS notification_preferences (
+        user_id TEXT PRIMARY KEY,
+        email_summary_enabled INTEGER NOT NULL DEFAULT 1,
+        summary_frequency TEXT NOT NULL DEFAULT 'daily',
+        order_updates INTEGER NOT NULL DEFAULT 1,
+        price_drops INTEGER NOT NULL DEFAULT 1,
+        promotional_offers INTEGER NOT NULL DEFAULT 1,
+        last_summary_sent_at TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
     `);
     const ensureCol = (table, col, defSql) => {
       const cols = sqlite.prepare(`PRAGMA table_info(${table})`).all();
@@ -10537,6 +12365,10 @@ var SqlitePreviewClient = class {
     ensureCol("offers", "priority", "INTEGER NOT NULL DEFAULT 10");
     ensureCol("offers", "rules_json", "TEXT");
     ensureCol("stores", "locations_json", "TEXT");
+    ensureCol("notifications", "category", "TEXT NOT NULL DEFAULT 'system'");
+    ensureCol("notifications", "action_url", "TEXT");
+    ensureCol("notifications", "metadata_json", "TEXT");
+    ensureCol("notifications", "emailed_at", "TEXT");
   }
   getDb() {
     if (!this.sqliteDb) throw new Error("Database not initialized.");
@@ -10760,10 +12592,46 @@ var ESSENTIAL_PAGES = [
   {
     id: "page-terms",
     slug: "terms",
-    title: { en: "Terms of Service", ar: "\u0634\u0631\u0648\u0637 \u0627\u0644\u0627\u0633\u062A\u062E\u062F\u0627\u0645" },
+    title: { en: "Terms & Conditions", ar: "\u0627\u0644\u0634\u0631\u0648\u0637 \u0648\u0627\u0644\u0623\u062D\u0643\u0627\u0645" },
     body: {
-      en: "Draft Terms of Service. Edit and publish from Admin Console \u2192 Pages before launch.",
-      ar: "\u0645\u0633\u0648\u062F\u0629 \u0634\u0631\u0648\u0637 \u0627\u0644\u0627\u0633\u062A\u062E\u062F\u0627\u0645. \u064A\u064F\u0631\u062C\u0649 \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629 \u0648\u0627\u0644\u0646\u0634\u0631 \u0645\u0646 \u0644\u0648\u062D\u0629 \u0627\u0644\u0625\u062F\u0627\u0631\u0629 \u0642\u0628\u0644 \u0627\u0644\u0625\u0637\u0644\u0627\u0642."
+      en: [
+        "1. Scope & Marketplace Role",
+        "NileLink operates as a curated multi-vendor e-commerce marketplace connecting independent Lebanese merchants with buyers across all eight Lebanese governorates. Each product listing is offered and fulfilled directly by the identified merchant unless expressly marked as NileLink Central Dispatch.",
+        "",
+        "2. Account Registration & Security",
+        "Buyers may browse publicly, save items to a local wishlist, or register an account for cross-device cart/wishlist sync, order tracking, and verified product reviews. You are responsible for safeguarding your password and optional Two-Factor Authentication (2FA) credentials.",
+        "",
+        "3. Dual USD / LBP Pricing & Checkout",
+        "Prices are maintained in integer USD minor units and converted transparently to Lebanese Pounds (LBP) using the active platform exchange rate displayed in the header. At checkout, the applied USD/LBP snapshot rate, shipping fees per seller sub-order, and applicable coupons or offers are locked into your confirmed order receipt.",
+        "",
+        "4. Split-Seller Orders & Delivery SLAs",
+        "When your shopping bag contains items from multiple independent merchants, NileLink splits checkout cleanly into separate sub-orders per merchant so delivery fees, dispatch tracking, and invoices remain transparent. Estimated delivery windows range between 1 and 5 business days depending on your governorate and district.",
+        "",
+        "5. Prohibited Conduct & Intellectual Property",
+        "Counterfeit listings, unauthorized automated scraping, abuse of promotional coupons, and fraudulent payment references are strictly prohibited and may result in immediate account suspension. All trademarks, editorial photography, and platform interfaces remain the property of NileLink and its respective merchants.",
+        "",
+        "6. Governing Law",
+        "These Terms & Conditions are governed by and construed in accordance with the applicable laws of the Republic of Lebanon."
+      ].join("\n"),
+      ar: [
+        "1. \u0646\u0637\u0627\u0642 \u0627\u0644\u0645\u0646\u0635\u0629 \u0648\u062F\u0648\u0631 \u0627\u0644\u0648\u0633\u064A\u0637 \u0627\u0644\u062A\u062C\u0627\u0631\u064A",
+        "\u062A\u0639\u0645\u0644 \u0645\u0646\u0635\u0629 \u0646\u0627\u064A\u0644 \u0644\u064A\u0646\u0643 (NileLink) \u0643\u0633\u0648\u0642 \u0625\u0644\u0643\u062A\u0631\u0648\u0646\u064A \u0644\u0628\u0646\u0627\u0646\u064A \u0645\u062A\u0639\u062F\u062F \u0627\u0644\u062A\u062C\u0627\u0631 \u064A\u0631\u0628\u0637 \u0627\u0644\u0645\u062A\u0627\u062C\u0631 \u0648\u0627\u0644\u0645\u0634\u0627\u063A\u0644 \u0627\u0644\u0644\u0628\u0646\u0627\u0646\u064A\u0629 \u0627\u0644\u0645\u0633\u062A\u0642\u0644\u0629 \u0628\u0627\u0644\u0645\u0634\u062A\u0631\u064A\u0646 \u0641\u064A \u0627\u0644\u0645\u062D\u0627\u0641\u0638\u0627\u062A \u0627\u0644\u0644\u0628\u0646\u0627\u0646\u064A\u0629 \u0627\u0644\u062B\u0645\u0627\u0646\u064A. \u064A\u064F\u0639\u0631\u0636 \u0643\u0644 \u0645\u0646\u062A\u062C \u0648\u064A\u064F\u062C\u0647\u0632 \u0645\u0628\u0627\u0634\u0631\u0629 \u0645\u0646 \u0642\u0628\u0644 \u0627\u0644\u062A\u0627\u062C\u0631 \u0627\u0644\u0645\u0648\u0636\u062D \u0627\u0633\u0645\u0647 \u0641\u064A \u0628\u0637\u0627\u0642\u0629 \u0627\u0644\u0645\u0646\u062A\u062C.",
+        "",
+        "2. \u0627\u0644\u062D\u0633\u0627\u0628\u0627\u062A \u0648\u0627\u0644\u0623\u0645\u0627\u0646",
+        "\u064A\u0645\u0643\u0646 \u0644\u0644\u0632\u0648\u0627\u0631 \u062A\u0635\u0641\u062D \u0627\u0644\u0643\u062A\u0627\u0644\u0648\u062C \u0648\u062D\u0641\u0638 \u0627\u0644\u0645\u0646\u062A\u062C\u0627\u062A \u0641\u064A \u0627\u0644\u0645\u0641\u0636\u0644\u0629 \u0645\u062D\u0644\u064A\u0627\u064B\u060C \u0623\u0648 \u0625\u0646\u0634\u0627\u0621 \u062D\u0633\u0627\u0628 \u0644\u0645\u0632\u0627\u0645\u0646\u0629 \u0627\u0644\u0645\u0641\u0636\u0644\u0629 \u0648\u0627\u0644\u062D\u0642\u064A\u0628\u0629 \u0648\u062A\u062A\u0628\u0639 \u0627\u0644\u0637\u0644\u0628\u0627\u062A \u0648\u0643\u062A\u0627\u0628\u0629 \u0627\u0644\u062A\u0642\u064A\u064A\u0645\u0627\u062A \u0627\u0644\u0645\u0648\u062B\u0642\u0629. \u064A\u062A\u062D\u0645\u0644 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u0645\u0633\u0624\u0648\u0644\u064A\u0629 \u0627\u0644\u062D\u0641\u0627\u0638 \u0639\u0644\u0649 \u0633\u0631\u064A\u0629 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0648\u0631\u0645\u0648\u0632 \u0627\u0644\u0645\u0635\u0627\u062F\u0642\u0629 \u0627\u0644\u062B\u0646\u0627\u0626\u064A\u0629 (2FA).",
+        "",
+        "3. \u0627\u0644\u062A\u0633\u0639\u064A\u0631 \u0627\u0644\u0645\u0632\u062F\u0648\u062C \u0628\u0627\u0644\u062F\u0648\u0644\u0627\u0631 \u0648\u0627\u0644\u0644\u064A\u0631\u0629 \u0627\u0644\u0644\u0628\u0646\u0627\u0646\u064A\u0629",
+        "\u062A\u064F\u062D\u062A\u0633\u0628 \u0627\u0644\u0623\u0633\u0639\u0627\u0631 \u0628\u062F\u0642\u0629 \u0628\u0627\u0644\u062F\u0648\u0644\u0627\u0631 \u0627\u0644\u0623\u0645\u064A\u0631\u0643\u064A \u0648\u062A\u064F\u0639\u0631\u0636 \u0645\u0642\u0627\u0628\u0644\u0647\u0627 \u0628\u0627\u0644\u0644\u064A\u0631\u0629 \u0627\u0644\u0644\u0628\u0646\u0627\u0646\u064A\u0629 \u0648\u0641\u0642 \u0633\u0639\u0631 \u0627\u0644\u0635\u0631\u0641 \u0627\u0644\u0645\u0639\u062A\u0645\u062F \u0627\u0644\u0638\u0627\u0647\u0631 \u0641\u064A \u0623\u0639\u0644\u0649 \u0627\u0644\u0645\u0646\u0635\u0629. \u0639\u0646\u062F \u062A\u0623\u0643\u064A\u062F \u0627\u0644\u0637\u0644\u0628\u060C \u064A\u062A\u0645 \u062A\u062B\u0628\u064A\u062A \u0633\u0639\u0631 \u0627\u0644\u0635\u0631\u0641 \u0648\u0631\u0633\u0648\u0645 \u0627\u0644\u062A\u0648\u0635\u064A\u0644 \u0648\u0627\u0644\u062E\u0635\u0648\u0645\u0627\u062A \u0641\u064A \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629 \u0627\u0644\u0646\u0647\u0627\u0626\u064A\u0629 \u0644\u0644\u0637\u0644\u0628.",
+        "",
+        "4. \u062A\u0642\u0633\u064A\u0645 \u0627\u0644\u0637\u0644\u0628\u0627\u062A \u062D\u0633\u0628 \u0627\u0644\u0645\u062A\u062C\u0631 \u0648\u0627\u0644\u062A\u0648\u0635\u064A\u0644",
+        "\u0639\u0646\u062F \u0627\u0644\u0634\u0631\u0627\u0621 \u0645\u0646 \u0623\u0643\u062B\u0631 \u0645\u0646 \u0645\u062A\u062C\u0631 \u0641\u064A \u0637\u0644\u0628 \u0648\u0627\u062D\u062F\u060C \u064A\u0646\u0642\u0633\u0645 \u0627\u0644\u0637\u0644\u0628 \u062A\u0644\u0642\u0627\u0626\u064A\u0627\u064B \u0625\u0644\u0649 \u0637\u0644\u0628\u0627\u062A \u0641\u0631\u0639\u064A\u0629 \u0645\u0633\u062A\u0642\u0644\u0629 \u0644\u0643\u0644 \u0628\u0627\u0626\u0639 \u0644\u0636\u0645\u0627\u0646 \u0648\u0636\u0648\u062D \u0631\u0633\u0648\u0645 \u0627\u0644\u0634\u062D\u0646 \u0648\u062A\u062A\u0628\u0639 \u0643\u0644 \u0634\u062D\u0646\u0629. \u062A\u062A\u0631\u0627\u0648\u062D \u0645\u062F\u0629 \u0627\u0644\u062A\u0648\u0635\u064A\u0644 \u0639\u0627\u062F\u0629 \u0628\u064A\u0646 \u064A\u0648\u0645 \u06485 \u0623\u064A\u0627\u0645 \u0639\u0645\u0644 \u062D\u0633\u0628 \u0627\u0644\u0645\u062D\u0627\u0641\u0638\u0629 \u0648\u0627\u0644\u0642\u0636\u0627\u0621.",
+        "",
+        "5. \u0627\u0644\u0627\u0633\u062A\u062E\u062F\u0627\u0645 \u0627\u0644\u0645\u0633\u0645\u0648\u062D \u0648\u0627\u0644\u0645\u0644\u0643\u064A\u0629 \u0627\u0644\u0641\u0643\u0631\u064A\u0629",
+        "\u064A\u064F\u062D\u0638\u0631 \u0639\u0631\u0636 \u0627\u0644\u0645\u0646\u062A\u062C\u0627\u062A \u0627\u0644\u0645\u0642\u0644\u062F\u0629 \u0623\u0648 \u0625\u0633\u0627\u0621\u0629 \u0627\u0633\u062A\u062E\u062F\u0627\u0645 \u0627\u0644\u0642\u0633\u0627\u0626\u0645 \u0627\u0644\u062A\u0631\u0648\u064A\u062C\u064A\u0629 \u0623\u0648 \u062A\u0642\u062F\u064A\u0645 \u0645\u0631\u0627\u062C\u0639 \u062A\u062D\u0648\u064A\u0644 \u0648\u0647\u0645\u064A\u0629\u060C \u0648\u064A\u062D\u0642 \u0644\u0644\u0625\u062F\u0627\u0631\u0629 \u062A\u0639\u0644\u064A\u0642 \u0623\u064A \u062D\u0633\u0627\u0628 \u0645\u062E\u0627\u0644\u0641 \u0641\u0648\u0631\u0627\u064B. \u062C\u0645\u064A\u0639 \u0627\u0644\u0639\u0644\u0627\u0645\u0627\u062A \u0627\u0644\u062A\u062C\u0627\u0631\u064A\u0629 \u0648\u0627\u0644\u0635\u0648\u0631 \u0648\u0627\u0644\u0645\u062D\u062A\u0648\u0649 \u0645\u062D\u0641\u0648\u0638\u0629 \u0644\u0623\u0635\u062D\u0627\u0628\u0647\u0627 \u0648\u0644\u0645\u0646\u0635\u0629 \u0646\u0627\u064A\u0644 \u0644\u064A\u0646\u0643.",
+        "",
+        "6. \u0627\u0644\u0642\u0627\u0646\u0648\u0646 \u0627\u0644\u0648\u0627\u062C\u0628 \u0627\u0644\u062A\u0637\u0628\u064A\u0642",
+        "\u062A\u062E\u0636\u0639 \u0647\u0630\u0647 \u0627\u0644\u0634\u0631\u0648\u0637 \u0648\u0627\u0644\u0623\u062D\u0643\u0627\u0645 \u0648\u062A\u064F\u0641\u0633\u0631 \u0648\u0641\u0642\u0627\u064B \u0644\u0644\u0642\u0648\u0627\u0646\u064A\u0646 \u0648\u0627\u0644\u0623\u0646\u0638\u0645\u0629 \u0627\u0644\u0645\u0631\u0639\u064A\u0629 \u0627\u0644\u0625\u062C\u0631\u0627\u0621 \u0641\u064A \u0627\u0644\u062C\u0645\u0647\u0648\u0631\u064A\u0629 \u0627\u0644\u0644\u0628\u0646\u0627\u0646\u064A\u0629."
+      ].join("\n")
     }
   },
   {
@@ -10771,17 +12639,83 @@ var ESSENTIAL_PAGES = [
     slug: "privacy",
     title: { en: "Privacy Policy", ar: "\u0633\u064A\u0627\u0633\u0629 \u0627\u0644\u062E\u0635\u0648\u0635\u064A\u0629" },
     body: {
-      en: "Draft Privacy Policy. Edit and publish from Admin Console \u2192 Pages before launch.",
-      ar: "\u0645\u0633\u0648\u062F\u0629 \u0633\u064A\u0627\u0633\u0629 \u0627\u0644\u062E\u0635\u0648\u0635\u064A\u0629. \u064A\u064F\u0631\u062C\u0649 \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629 \u0648\u0627\u0644\u0646\u0634\u0631 \u0645\u0646 \u0644\u0648\u062D\u0629 \u0627\u0644\u0625\u062F\u0627\u0631\u0629 \u0642\u0628\u0644 \u0627\u0644\u0625\u0637\u0644\u0627\u0642."
+      en: [
+        "1. Information We Collect",
+        "We collect only the information required to operate marketplace orders and accounts reliably: full name, Lebanese mobile phone (+961), email address, delivery governorate/district/town and street notes, saved wishlist/cart items, and storefront branch coordinates published by registered merchants.",
+        "",
+        "2. How Your Data Is Used",
+        "Your contact and address details are shared strictly with the specific merchant(s) and delivery couriers fulfilling your sub-order(s), as well as for transactional emails, order notifications, dispute resolution, and fraud prevention.",
+        "",
+        "3. Security, Cookies & Local Storage",
+        "Authenticated sessions use HttpOnly secure cookies paired with CSRF verification tokens. Passwords are stored exclusively as cryptographic salted hashes. For unauthenticated visitors, cart and wishlist preferences are stored locally in your browser (localStorage) until you choose to sign in.",
+        "",
+        "4. Payment Information",
+        "Cash on Delivery (COD) and manual Whish Money / OMT transfers record only order totals and transfer references. Online card payments are processed through configured external payment gateways; NileLink never stores raw card numbers or CVV codes.",
+        "",
+        "5. Marketing Communications & Opt-Out",
+        "You receive promotional broadcasts only when you explicitly subscribe. Every promotional email includes a single-click unsubscribe link.",
+        "",
+        "6. Your Rights & Support",
+        "You may update your profile preferences, remove saved addresses, sign out of all active sessions, or request account deletion at any time via Account Settings or our Support Center."
+      ].join("\n"),
+      ar: [
+        "1. \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062A\u064A \u0646\u062C\u0645\u0639\u0647\u0627",
+        "\u0646\u062C\u0645\u0639 \u0641\u0642\u0637 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u0636\u0631\u0648\u0631\u064A\u0629 \u0644\u0625\u062A\u0645\u0627\u0645 \u0627\u0644\u0637\u0644\u0628\u0627\u062A \u0648\u0625\u062F\u0627\u0631\u0629 \u0627\u0644\u062D\u0633\u0627\u0628\u0627\u062A: \u0627\u0644\u0627\u0633\u0645 \u0627\u0644\u0643\u0627\u0645\u0644\u060C \u0631\u0642\u0645 \u0627\u0644\u0647\u0627\u062A\u0641 \u0627\u0644\u0644\u0628\u0646\u0627\u0646\u064A (+961)\u060C \u0627\u0644\u0628\u0631\u064A\u062F \u0627\u0644\u0625\u0644\u0643\u062A\u0631\u0648\u0646\u064A\u060C \u0639\u0646\u0648\u0627\u0646 \u0627\u0644\u062A\u0648\u0635\u064A\u0644 (\u0627\u0644\u0645\u062D\u0627\u0641\u0638\u0629\u060C \u0627\u0644\u0642\u0636\u0627\u0621\u060C \u0627\u0644\u0628\u0644\u062F\u0629\u060C \u0648\u062A\u0641\u0627\u0635\u064A\u0644 \u0627\u0644\u0645\u0628\u0646\u0649)\u060C \u0625\u0636\u0627\u0641\u0629 \u0625\u0644\u0649 \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0645\u0641\u0636\u0644\u0629 \u0648\u0627\u0644\u062D\u0642\u064A\u0628\u0629\u060C \u0648\u0625\u062D\u062F\u0627\u062B\u064A\u0627\u062A \u0627\u0644\u0641\u0631\u0648\u0639 \u0627\u0644\u062A\u064A \u064A\u0646\u0634\u0631\u0647\u0627 \u0623\u0635\u062D\u0627\u0628 \u0627\u0644\u0645\u062A\u0627\u062C\u0631.",
+        "",
+        "2. \u0643\u064A\u0641\u064A\u0629 \u0627\u0633\u062A\u062E\u062F\u0627\u0645 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A",
+        "\u062A\u064F\u0633\u062A\u062E\u062F\u0645 \u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062A\u0648\u0627\u0635\u0644 \u0648\u0627\u0644\u0639\u0646\u0648\u0627\u0646 \u062D\u0635\u0631\u064A\u0627\u064B \u0644\u062A\u0646\u0641\u064A\u0630 \u0627\u0644\u0637\u0644\u0628\u0627\u062A \u0627\u0644\u0641\u0631\u0639\u064A\u0629 \u0645\u0639 \u0627\u0644\u062A\u0627\u062C\u0631 \u0648\u0634\u0631\u0643\u0629 \u0627\u0644\u062A\u0648\u0635\u064A\u0644\u060C \u0648\u0625\u0631\u0633\u0627\u0644 \u0625\u0634\u0639\u0627\u0631\u0627\u062A \u062D\u0627\u0644\u0629 \u0627\u0644\u0637\u0644\u0628\u060C \u0648\u0645\u0639\u0627\u0644\u062C\u0629 \u0637\u0644\u0628\u0627\u062A \u0627\u0644\u0625\u0631\u062C\u0627\u0639 \u0623\u0648 \u0627\u0644\u0646\u0632\u0627\u0639\u0627\u062A \u0648\u0645\u0646\u0639 \u0627\u0644\u0627\u062D\u062A\u064A\u0627\u0644.",
+        "",
+        "3. \u0627\u0644\u062D\u0645\u0627\u064A\u0629 \u0648\u0645\u0644\u0641\u0627\u062A \u062A\u0639\u0631\u064A\u0641 \u0627\u0644\u0627\u0631\u062A\u0628\u0627\u0637 \u0648\u0627\u0644\u062A\u062E\u0632\u064A\u0646 \u0627\u0644\u0645\u062D\u0644\u064A",
+        "\u062A\u064F\u062F\u0627\u0631 \u062C\u0644\u0633\u0627\u062A \u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644 \u0639\u0628\u0631 \u0645\u0644\u0641\u0627\u062A \u062A\u0639\u0631\u064A\u0641 \u0627\u0631\u062A\u0628\u0627\u0637 \u0622\u0645\u0646\u0629 (HttpOnly) \u0645\u062D\u0645\u064A\u0629 \u0628\u0631\u0645\u0648\u0632 CSRF\u060C \u0648\u062A\u064F\u062D\u0641\u0638 \u0643\u0644\u0645\u0627\u062A \u0627\u0644\u0645\u0631\u0648\u0631 \u0628\u062A\u0634\u0641\u064A\u0631 \u0623\u062D\u0627\u062F\u064A \u0627\u0644\u0627\u062A\u062C\u0627\u0647. \u0628\u0627\u0644\u0646\u0633\u0628\u0629 \u0644\u0644\u0632\u0648\u0627\u0631 \u063A\u064A\u0631 \u0627\u0644\u0645\u0633\u062C\u0644\u064A\u0646\u060C \u062A\u064F\u062D\u0641\u0638 \u0627\u0644\u0645\u0641\u0636\u0644\u0629 \u0648\u062D\u0642\u064A\u0628\u0629 \u0627\u0644\u062A\u0633\u0648\u0642 \u0645\u062D\u0644\u064A\u0627\u064B \u0639\u0644\u0649 \u0645\u062A\u0635\u0641\u062D\u0643 \u0641\u0642\u0637 \u062D\u062A\u0649 \u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644.",
+        "",
+        "4. \u0633\u0631\u064A\u0629 \u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062F\u0641\u0639",
+        "\u0639\u0646\u062F \u0627\u062E\u062A\u064A\u0627\u0631 \u0627\u0644\u062F\u0641\u0639 \u0639\u0646\u062F \u0627\u0644\u0627\u0633\u062A\u0644\u0627\u0645 \u0623\u0648 \u0627\u0644\u062A\u062D\u0648\u064A\u0644 \u0639\u0628\u0631 Whish / OMT \u064A\u064F\u0633\u062C\u0644 \u0645\u0631\u062C\u0639 \u0627\u0644\u062A\u062D\u0648\u064A\u0644 \u0641\u0642\u0637 \u0644\u0644\u062A\u062D\u0642\u0642. \u0623\u0645\u0627 \u0627\u0644\u0645\u062F\u0641\u0648\u0639\u0627\u062A \u0628\u0627\u0644\u0628\u0637\u0627\u0642\u0629 \u0641\u062A\u062A\u0645 \u0639\u0628\u0631 \u0645\u0632\u0648\u062F \u0627\u0644\u062F\u0641\u0639 \u0627\u0644\u0645\u0639\u062A\u0645\u062F \u062F\u0648\u0646 \u0623\u0646 \u062A\u062E\u0632\u0646 \u0627\u0644\u0645\u0646\u0635\u0629 \u0623\u0631\u0642\u0627\u0645 \u0627\u0644\u0628\u0637\u0627\u0642\u0627\u062A \u0623\u0648 \u0631\u0645\u0648\u0632 \u0627\u0644\u0623\u0645\u0627\u0646.",
+        "",
+        "5. \u0627\u0644\u0631\u0633\u0627\u0626\u0644 \u0627\u0644\u062A\u0631\u0648\u064A\u062C\u064A\u0629 \u0648\u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",
+        "\u0644\u0627 \u0646\u0631\u0633\u0644 \u0646\u0634\u0631\u0627\u062A \u062A\u0631\u0648\u064A\u062C\u064A\u0629 \u0625\u0644\u0627 \u0628\u0639\u062F \u0645\u0648\u0627\u0641\u0642\u062A\u0643 \u0648\u0627\u0634\u062A\u0631\u0627\u0643\u0643 \u0627\u0644\u0635\u0631\u064A\u062D\u060C \u0645\u0639 \u062A\u0648\u0641\u064A\u0631 \u0631\u0627\u0628\u0637 \u0644\u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u0641\u0648\u0631\u064A \u0641\u064A \u0643\u0644 \u0631\u0633\u0627\u0644\u0629.",
+        "",
+        "6. \u062D\u0642\u0648\u0642\u0643 \u0648\u0627\u0644\u062A\u0648\u0627\u0635\u0644",
+        "\u064A\u0645\u0643\u0646\u0643 \u062A\u0639\u062F\u064A\u0644 \u0628\u064A\u0627\u0646\u0627\u062A\u0643\u060C \u062D\u0630\u0641 \u0639\u0646\u0627\u0648\u064A\u0646\u0643\u060C \u0625\u0646\u0647\u0627\u0621 \u0627\u0644\u062C\u0644\u0633\u0627\u062A \u0645\u0646 \u0643\u0644 \u0627\u0644\u0623\u062C\u0647\u0632\u0629\u060C \u0623\u0648 \u0637\u0644\u0628 \u062D\u0630\u0641 \u0627\u0644\u062D\u0633\u0627\u0628 \u0639\u0628\u0631 \u0635\u0641\u062D\u0629 \u062D\u0633\u0627\u0628\u064A \u0623\u0648 \u0645\u0631\u0643\u0632 \u0627\u0644\u062F\u0639\u0645."
+      ].join("\n")
     }
   },
   {
     id: "page-returns",
     slug: "returns",
-    title: { en: "Return & Refund Policy", ar: "\u0633\u064A\u0627\u0633\u0629 \u0627\u0644\u0625\u0631\u062C\u0627\u0639 \u0648\u0627\u0644\u0627\u0633\u062A\u0631\u062F\u0627\u062F" },
+    title: { en: "Return & Refund Policy", ar: "\u0633\u064A\u0627\u0633\u0629 \u0627\u0644\u0625\u0631\u062C\u0627\u0639" },
     body: {
-      en: "Draft Return Policy. Edit and publish from Admin Console \u2192 Pages before launch.",
-      ar: "\u0645\u0633\u0648\u062F\u0629 \u0633\u064A\u0627\u0633\u0629 \u0627\u0644\u0625\u0631\u062C\u0627\u0639. \u064A\u064F\u0631\u062C\u0649 \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629 \u0648\u0627\u0644\u0646\u0634\u0631 \u0645\u0646 \u0644\u0648\u062D\u0629 \u0627\u0644\u0625\u062F\u0627\u0631\u0629 \u0642\u0628\u0644 \u0627\u0644\u0625\u0637\u0644\u0627\u0642."
+      en: [
+        "1. Standard 14-Day Return Window",
+        "Eligible items may be returned within 14 calendar days from confirmed delivery, provided they remain unused, unwashed, with original tags, seals, serial numbers, and packaging intact (unless the item arrived damaged or defective). Individual merchants may specify extended store return terms directly on their storefront page.",
+        "",
+        "2. Non-Returnable Items",
+        "For hygiene, safety, and authenticity reasons, opened personal care products, custom-tailored items, perishable food items, and software/digital activation codes cannot be returned unless defective or misrepresented.",
+        "",
+        "3. How to Request a Return or Dispute",
+        "Open Orders & Tracking using your order number (or sign in to your Account), select the relevant seller sub-order, and submit a Return Request stating the reason. If a merchant disagrees or fails to respond within 48 business hours, you may escalate directly to an Admin Dispute.",
+        "",
+        "4. Return Shipping Responsibility",
+        "If the product is defective, damaged in transit, or differs materially from verified specifications, the merchant covers return pickup fees in full. For size exchanges or change-of-mind returns, standard governorate courier fees apply.",
+        "",
+        "5. Inspection & Refund Timing",
+        "Once the returned item is inspected by the merchant, approved refunds are issued within 3 to 5 business days back to your original payment channel (Whish Money, OMT, Card reversal, or cash settlement)."
+      ].join("\n"),
+      ar: [
+        "1. \u0645\u0647\u0644\u0629 \u0627\u0644\u0625\u0631\u062C\u0627\u0639 \u0627\u0644\u0642\u064A\u0627\u0633\u064A\u0629 (14 \u064A\u0648\u0645\u0627\u064B)",
+        "\u064A\u062D\u0642 \u0644\u0644\u0645\u0634\u062A\u0631\u064A \u0637\u0644\u0628 \u0625\u0631\u062C\u0627\u0639 \u0627\u0644\u0645\u0646\u062A\u062C\u0627\u062A \u0627\u0644\u0645\u0624\u0647\u0644\u0629 \u062E\u0644\u0627\u0644 14 \u064A\u0648\u0645\u0627\u064B \u0645\u0646 \u062A\u0627\u0631\u064A\u062E \u062A\u0623\u0643\u064A\u062F \u0627\u0644\u0627\u0633\u062A\u0644\u0627\u0645\u060C \u0628\u0634\u0631\u0637 \u0628\u0642\u0627\u0621 \u0627\u0644\u0645\u0646\u062A\u062C \u0628\u062D\u0627\u0644\u062A\u0647 \u0627\u0644\u0623\u0635\u0644\u064A\u0629 \u063A\u064A\u0631 \u0645\u0633\u062A\u062E\u062F\u0645 \u0648\u0645\u0639 \u0643\u0627\u0645\u0644 \u0627\u0644\u062A\u063A\u0644\u064A\u0641 \u0648\u0627\u0644\u0645\u0644\u0635\u0642\u0627\u062A \u0648\u0627\u0644\u0631\u0642\u0645 \u0627\u0644\u062A\u0633\u0644\u0633\u0644\u064A (\u0628\u0627\u0633\u062A\u062B\u0646\u0627\u0621 \u062D\u0627\u0644\u0627\u062A \u0627\u0644\u062A\u0644\u0641 \u0623\u0648 \u0627\u0644\u0639\u064A\u0628 \u0627\u0644\u0645\u0635\u0646\u0639\u064A). \u0643\u0645\u0627 \u0642\u062F \u064A\u062D\u062F\u062F \u0628\u0639\u0636 \u0627\u0644\u062A\u062C\u0627\u0631 \u0633\u064A\u0627\u0633\u0627\u062A \u0625\u0636\u0627\u0641\u064A\u0629 \u0648\u0627\u0636\u062D\u0629 \u0641\u064A \u0635\u0641\u062D\u0629 \u0645\u062A\u062C\u0631\u0647\u0645.",
+        "",
+        "2. \u0627\u0644\u0645\u0646\u062A\u062C\u0627\u062A \u0627\u0644\u0645\u0633\u062A\u062B\u0646\u0627\u0629 \u0645\u0646 \u0627\u0644\u0625\u0631\u062C\u0627\u0639",
+        "\u062D\u0631\u0635\u0627\u064B \u0639\u0644\u0649 \u0627\u0644\u0633\u0644\u0627\u0645\u0629 \u0648\u0627\u0644\u0635\u062D\u0629 \u0627\u0644\u0639\u0627\u0645\u0629\u060C \u0644\u0627 \u064A\u0634\u0645\u0644 \u0627\u0644\u0625\u0631\u062C\u0627\u0639 (\u0625\u0644\u0627 \u0641\u064A \u062D\u0627\u0644 \u0648\u062C\u0648\u062F \u0639\u064A\u0628 \u0623\u0648 \u062E\u0637\u0623 \u0641\u064A \u0627\u0644\u0645\u0648\u0627\u0635\u0641\u0627\u062A): \u0645\u0633\u062A\u0644\u0632\u0645\u0627\u062A \u0627\u0644\u0639\u0646\u0627\u064A\u0629 \u0627\u0644\u0634\u062E\u0635\u064A\u0629 \u0627\u0644\u0645\u0641\u062A\u0648\u062D\u0629\u060C \u0627\u0644\u0645\u0646\u062A\u062C\u0627\u062A \u0627\u0644\u0645\u0641\u0635\u0644\u0629 \u062D\u0633\u0628 \u0627\u0644\u0637\u0644\u0628\u060C \u0627\u0644\u0645\u0648\u0627\u062F \u0627\u0644\u0642\u0627\u0628\u0644\u0629 \u0644\u0644\u062A\u0644\u0641 \u0627\u0644\u0633\u0631\u064A\u0639\u060C \u0648\u0627\u0644\u0628\u0637\u0627\u0642\u0627\u062A \u0623\u0648 \u0627\u0644\u062A\u0631\u0627\u062E\u064A\u0635 \u0627\u0644\u0631\u0642\u0645\u064A\u0629 \u0627\u0644\u0645\u0641\u0639\u0651\u0644\u0629.",
+        "",
+        "3. \u062E\u0637\u0648\u0627\u062A \u062A\u0642\u062F\u064A\u0645 \u0637\u0644\u0628 \u0627\u0644\u0625\u0631\u062C\u0627\u0639 \u0623\u0648 \u0627\u0644\u0646\u0632\u0627\u0639",
+        '\u0627\u0646\u062A\u0642\u0644 \u0625\u0644\u0649 \u0635\u0641\u062D\u0629 "\u0637\u0644\u0628\u0627\u062A\u064A \u0648\u062A\u062A\u0628\u0639 \u0627\u0644\u0634\u062D\u0646" \u0623\u0648 "\u062D\u0633\u0627\u0628\u064A"\u060C \u0648\u0627\u062E\u062A\u0631 \u0627\u0644\u0637\u0644\u0628 \u0627\u0644\u0641\u0631\u0639\u064A \u0627\u0644\u062E\u0627\u0635 \u0628\u0627\u0644\u062A\u0627\u062C\u0631\u060C \u062B\u0645 \u0627\u0636\u063A\u0637 \u0639\u0644\u0649 "\u0637\u0644\u0628 \u0625\u0631\u062C\u0627\u0639" \u0645\u0639 \u062A\u0648\u0636\u064A\u062D \u0627\u0644\u0633\u0628\u0628. \u0641\u064A \u062D\u0627\u0644 \u0639\u062F\u0645 \u0627\u0633\u062A\u062C\u0627\u0628\u0629 \u0627\u0644\u062A\u0627\u062C\u0631 \u062E\u0644\u0627\u0644 48 \u0633\u0627\u0639\u0629 \u0639\u0645\u0644\u060C \u064A\u0645\u0643\u0646\u0643 \u0641\u062A\u062D \u0646\u0632\u0627\u0639 \u0644\u062A\u062A\u062F\u062E\u0644 \u0625\u062F\u0627\u0631\u0629 \u0627\u0644\u0645\u0646\u0635\u0629 \u0648\u062A\u0641\u0635\u0644 \u0641\u064A \u0627\u0644\u0637\u0644\u0628.',
+        "",
+        "4. \u062A\u0643\u0644\u0641\u0629 \u0634\u062D\u0646 \u0627\u0644\u0625\u0631\u062C\u0627\u0639",
+        "\u064A\u062A\u062D\u0645\u0644 \u0627\u0644\u062A\u0627\u062C\u0631 \u0643\u0627\u0645\u0644 \u0631\u0633\u0648\u0645 \u0634\u062D\u0646 \u0627\u0644\u0625\u0631\u062C\u0627\u0639 \u0625\u0630\u0627 \u0648\u0635\u0644 \u0627\u0644\u0645\u0646\u062A\u062C \u062A\u0627\u0644\u0641\u0627\u064B \u0623\u0648 \u0645\u0639\u064A\u0628\u0627\u064B \u0623\u0648 \u0645\u062E\u0627\u0644\u0641\u0627\u064B \u0644\u0644\u0645\u0648\u0627\u0635\u0641\u0627\u062A \u0627\u0644\u0645\u0639\u0644\u0646\u0629. \u0623\u0645\u0627 \u0641\u064A \u062D\u0627\u0644\u0627\u062A \u062A\u063A\u064A\u064A\u0631 \u0627\u0644\u0645\u0642\u0627\u0633 \u0623\u0648 \u0627\u0644\u0639\u062F\u0648\u0644 \u0639\u0646 \u0627\u0644\u0634\u0631\u0627\u0621 \u0641\u062A\u064F\u0637\u0628\u0642 \u0631\u0633\u0648\u0645 \u0627\u0644\u062A\u0648\u0635\u064A\u0644 \u0627\u0644\u0645\u0639\u062A\u0645\u062F\u0629 \u0644\u0644\u0645\u0646\u0637\u0642\u0629.",
+        "",
+        "5. \u0627\u0644\u0641\u062D\u0635 \u0648\u0627\u0633\u062A\u0631\u062F\u0627\u062F \u0627\u0644\u0645\u0628\u0627\u0644\u063A",
+        "\u0628\u0639\u062F \u0627\u0633\u062A\u0644\u0627\u0645 \u0627\u0644\u0645\u0631\u062A\u062C\u0639 \u0648\u0627\u0644\u062A\u062D\u0642\u0642 \u0645\u0646 \u062D\u0627\u0644\u062A\u0647\u060C \u064A\u064F\u0639\u0627\u062F \u0627\u0644\u0645\u0628\u0644\u063A \u0627\u0644\u0645\u0639\u062A\u0645\u062F \u062E\u0644\u0627\u0644 3 \u0625\u0644\u0649 5 \u0623\u064A\u0627\u0645 \u0639\u0645\u0644 \u0639\u0628\u0631 \u0646\u0641\u0633 \u0648\u0633\u064A\u0644\u0629 \u0627\u0644\u062F\u0641\u0639 \u0627\u0644\u0623\u0635\u0644\u064A\u0629 (Whish Money \u0623\u0648 OMT \u0623\u0648 \u0627\u0633\u062A\u0631\u062F\u0627\u062F \u0627\u0644\u0628\u0637\u0627\u0642\u0629 \u0623\u0648 \u0627\u0644\u062A\u0633\u0648\u064A\u0629 \u0627\u0644\u0646\u0642\u062F\u064A\u0629)."
+      ].join("\n")
     }
   },
   {
@@ -10789,8 +12723,44 @@ var ESSENTIAL_PAGES = [
     slug: "seller-agreement",
     title: { en: "Seller Agreement", ar: "\u0627\u062A\u0641\u0627\u0642\u064A\u0629 \u0627\u0644\u0628\u0627\u0626\u0639" },
     body: {
-      en: "Draft Seller Agreement covering commission locking, delivery SLAs, and payout holds.",
-      ar: "\u0645\u0633\u0648\u062F\u0629 \u0627\u062A\u0641\u0627\u0642\u064A\u0629 \u0627\u0644\u0628\u0627\u0626\u0639 \u0627\u0644\u0645\u062A\u0639\u0644\u0642\u0629 \u0628\u0627\u0644\u0639\u0645\u0648\u0644\u0627\u062A \u0648\u0627\u0644\u062A\u0648\u0635\u064A\u0644 \u0648\u0641\u062A\u0631\u0629 \u062D\u062C\u0632 \u0627\u0644\u0623\u0631\u0628\u0627\u062D."
+      en: [
+        "1. Merchant Verification & Onboarding (KYC)",
+        "To operate a storefront on NileLink, sellers must provide accurate legal identity details, a valid Commercial Registration reference (CR / \u0648\u0632\u0627\u0631\u0629 \u0627\u0644\u0645\u0627\u0644\u064A\u0629), verified Lebanese phone/WhatsApp contact details, and accurate payout account information (Whish Money, OMT, or Bank Transfer).",
+        "",
+        "2. Product Accuracy, Stock & Pricing Integrity",
+        "Sellers commit to publishing authentic items only, accurate technical specifications, real stock counts per SKU/variant, and clear base pricing in USD (automatically synced to LBP daily). Repeated cancellations due to out-of-stock listings affect storefront trust ratings.",
+        "",
+        "3. Fulfillment SLAs & Physical Store Locations",
+        "Merchants must pack and dispatch confirmed sub-orders within their declared processing SLA (default 24 hours). Sellers operating physical showrooms or pickup branches may publish verified Google Maps coordinates and operating hours from their Seller Dashboard.",
+        "",
+        "4. Platform Commission & Subscription Tiers",
+        "Each completed sub-order carries an itemized commission calculated in order of precedence: custom merchant override (if configured), category rate, or platform default rate, minus any commission discount granted by the seller\u2019s active subscription tier.",
+        "",
+        "5. Escrow Hold Period & Payout Releases",
+        "Net seller earnings are credited to pending balance upon order confirmation and become eligible for payout withdrawal after the configured escrow hold window following confirmed delivery (providing buffer for return checks and buyer protection). Payouts settle via Whish Money, OMT, or bank transfer with traceable reference codes.",
+        "",
+        "6. Vacation Mode & Store Suspension",
+        "Sellers taking scheduled leave must enable Vacation Mode in Storefront Settings to notify buyers transparently. NileLink reserves the right to pause storefronts or withhold disputed funds where counterfeit goods, unfulfilled orders, or policy violations occur."
+      ].join("\n"),
+      ar: [
+        "1. \u0627\u0644\u062A\u0648\u062B\u064A\u0642 \u0648\u0627\u0639\u062A\u0645\u0627\u062F \u0627\u0644\u062A\u0627\u062C\u0631 (KYC)",
+        "\u064A\u0634\u062A\u0631\u0637 \u0644\u062A\u0641\u0639\u064A\u0644 \u0623\u064A \u0645\u062A\u062C\u0631 \u0639\u0644\u0649 \u0646\u0627\u064A\u0644 \u0644\u064A\u0646\u0643 \u062A\u0642\u062F\u064A\u0645 \u0628\u064A\u0627\u0646\u0627\u062A \u0642\u0627\u0646\u0648\u0646\u064A\u0629 \u0635\u062D\u064A\u062D\u0629\u060C \u0648\u0631\u0642\u0645 \u0645\u0631\u062C\u0639 \u0627\u0644\u0633\u062C\u0644 \u0627\u0644\u062A\u062C\u0627\u0631\u064A \u0623\u0648 \u0627\u0644\u0645\u0627\u0644\u064A\u060C \u0648\u0631\u0642\u0645 \u0647\u0627\u062A\u0641 \u0648\u0648\u0627\u062A\u0633\u0627\u0628 \u0644\u0628\u0646\u0627\u0646\u064A \u0645\u0648\u062B\u0642\u060C \u0648\u062D\u0633\u0627\u0628 \u062A\u062D\u0648\u064A\u0644 \u0623\u0631\u0628\u0627\u062D \u0635\u0627\u0644\u062D (Whish Money \u0623\u0648 OMT \u0623\u0648 \u062D\u0633\u0627\u0628 \u0645\u0635\u0631\u0641\u064A).",
+        "",
+        "2. \u062F\u0642\u0629 \u0627\u0644\u0645\u0646\u062A\u062C\u0627\u062A \u0648\u0627\u0644\u0645\u062E\u0632\u0648\u0646 \u0648\u0627\u0644\u062A\u0633\u0639\u064A\u0631",
+        "\u064A\u0644\u062A\u0632\u0645 \u0627\u0644\u0628\u0627\u0626\u0639 \u0628\u0639\u0631\u0636 \u0645\u0646\u062A\u062C\u0627\u062A \u0623\u0635\u0644\u064A\u0629 \u0645\u0637\u0627\u0628\u0642\u0629 \u0644\u0644\u0645\u0648\u0627\u0635\u0641\u0627\u062A \u0627\u0644\u0645\u0648\u062B\u0642\u0629 \u0645\u0639 \u062A\u062D\u062F\u064A\u062B \u0643\u0645\u064A\u0627\u062A \u0627\u0644\u0645\u062E\u0632\u0648\u0646 \u0644\u0643\u0644 \u062E\u064A\u0627\u0631 (SKU) \u0648\u062A\u062D\u062F\u064A\u062F \u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0623\u0633\u0627\u0633\u064A \u0628\u0627\u0644\u062F\u0648\u0644\u0627\u0631 \u0628\u0648\u0636\u0648\u062D. \u064A\u0624\u062B\u0631 \u062A\u0643\u0631\u0627\u0631 \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0637\u0644\u0628\u0627\u062A \u0628\u0633\u0628\u0628 \u0646\u0641\u0627\u062F \u0627\u0644\u0643\u0645\u064A\u0629 \u0639\u0644\u0649 \u062A\u0635\u0646\u064A\u0641 \u0627\u0644\u062B\u0642\u0629 \u0627\u0644\u062E\u0627\u0635 \u0628\u0627\u0644\u0645\u062A\u062C\u0631.",
+        "",
+        "3. \u0645\u0647\u0644\u0629 \u0627\u0644\u062A\u062C\u0647\u064A\u0632 \u0648\u0641\u0631\u0648\u0639 \u0627\u0644\u0627\u0633\u062A\u0644\u0627\u0645 \u0639\u0644\u0649 \u0627\u0644\u062E\u0631\u064A\u0637\u0629",
+        "\u064A\u0644\u062A\u0632\u0645 \u0627\u0644\u0628\u0627\u0626\u0639 \u0628\u062A\u062C\u0647\u064A\u0632 \u0627\u0644\u0637\u0644\u0628\u0627\u062A \u0627\u0644\u0641\u0631\u0639\u064A\u0629 \u0627\u0644\u0645\u0624\u0643\u062F\u0629 \u0648\u062A\u0633\u0644\u064A\u0645\u0647\u0627 \u0644\u0634\u0631\u0643\u0629 \u0627\u0644\u062A\u0648\u0635\u064A\u0644 \u062E\u0644\u0627\u0644 \u0627\u0644\u0645\u0647\u0644\u0629 \u0627\u0644\u0645\u062D\u062F\u062F\u0629 \u0641\u064A \u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0644\u0645\u062A\u062C\u0631 (\u0627\u0644\u0627\u0641\u062A\u0631\u0627\u0636\u064A 24 \u0633\u0627\u0639\u0629). \u0643\u0645\u0627 \u064A\u0645\u0643\u0646 \u0644\u0644\u062A\u062C\u0627\u0631 \u0625\u0636\u0627\u0641\u0629 \u0645\u0648\u0627\u0642\u0639 \u0641\u0631\u0648\u0639\u0647\u0645 \u0627\u0644\u0641\u0639\u0644\u064A\u0629 \u0648\u0633\u0627\u0639\u0627\u062A \u0627\u0644\u0639\u0645\u0644 \u0639\u0644\u0649 \u0627\u0644\u062E\u0631\u064A\u0637\u0629 \u0644\u0631\u0641\u0639 \u0645\u0648\u062B\u0648\u0642\u064A\u0629 \u0627\u0644\u0645\u062A\u062C\u0631 \u0623\u0645\u0627\u0645 \u0627\u0644\u0645\u0634\u062A\u0631\u064A\u0646.",
+        "",
+        "4. \u0627\u0644\u0639\u0645\u0648\u0644\u0627\u062A \u0648\u0628\u0627\u0642\u0627\u062A \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",
+        "\u062A\u064F\u062D\u062A\u0633\u0628 \u0639\u0645\u0648\u0644\u0629 \u0627\u0644\u0645\u0646\u0635\u0629 \u0639\u0644\u0649 \u0643\u0644 \u0637\u0644\u0628 \u0641\u0631\u0639\u064A \u0645\u0643\u062A\u0645\u0644 \u0628\u0634\u0641\u0627\u0641\u064A\u0629 \u062A\u0627\u0645\u0629 (\u0648\u0641\u0642 \u0646\u0633\u0628\u0629 \u0627\u0644\u0645\u062A\u062C\u0631 \u0627\u0644\u062E\u0627\u0635\u0629 \u0623\u0648 \u0639\u0645\u0648\u0644\u0629 \u0627\u0644\u0641\u0626\u0629 \u0623\u0648 \u0627\u0644\u0646\u0633\u0628\u0629 \u0627\u0644\u0627\u0641\u062A\u0631\u0627\u0636\u064A\u0629 \u0644\u0644\u0645\u0646\u0635\u0629\u060C \u0645\u062E\u0635\u0648\u0645\u0627\u064B \u0645\u0646\u0647\u0627 \u0646\u0633\u0628\u0629 \u0627\u0644\u062A\u062E\u0641\u064A\u0636 \u0627\u0644\u0645\u0634\u0645\u0648\u0644\u0629 \u0641\u064A \u0628\u0627\u0642\u0629 \u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u062A\u0627\u062C\u0631).",
+        "",
+        "5. \u0641\u062A\u0631\u0629 \u0627\u0644\u062D\u062C\u0632 \u0627\u0644\u0645\u0627\u0644\u064A \u0648\u062A\u062D\u0648\u064A\u0644 \u0627\u0644\u0623\u0631\u0628\u0627\u062D",
+        "\u062A\u064F\u0642\u064A\u062F \u0635\u0627\u0641\u064A \u0623\u0631\u0628\u0627\u062D \u0627\u0644\u062A\u0627\u062C\u0631 \u0641\u064A \u0627\u0644\u0631\u0635\u064A\u062F \u0627\u0644\u0645\u0639\u0644\u0642 \u062B\u0645 \u062A\u0646\u062A\u0642\u0644 \u0625\u0644\u0649 \u0627\u0644\u0631\u0635\u064A\u062F \u0627\u0644\u0642\u0627\u0628\u0644 \u0644\u0644\u0633\u062D\u0628 \u0628\u0639\u062F \u0627\u0646\u0642\u0636\u0627\u0621 \u0641\u062A\u0631\u0629 \u0627\u0644\u062D\u062C\u0632 \u0627\u0644\u0645\u062D\u062F\u062F\u0629 \u0645\u0646 \u062A\u0627\u0631\u064A\u062E \u062A\u0623\u0643\u064A\u062F \u0627\u0644\u062A\u0633\u0644\u064A\u0645 \u0644\u0636\u0645\u0627\u0646 \u062D\u0642\u0648\u0642 \u0627\u0644\u0625\u0631\u062C\u0627\u0639. \u062A\u062A\u0645 \u0627\u0644\u062A\u0633\u0648\u064A\u0627\u062A \u0639\u0628\u0631 Whish Money \u0623\u0648 OMT \u0623\u0648 \u0627\u0644\u062A\u062D\u0648\u064A\u0644 \u0627\u0644\u0645\u0635\u0631\u0641\u064A \u0645\u0639 \u0631\u0642\u0645 \u0645\u0631\u062C\u0639 \u0645\u0648\u062B\u0642 \u0644\u0643\u0644 \u062F\u0641\u0639\u0629.",
+        "",
+        "6. \u0648\u0636\u0639 \u0627\u0644\u0625\u062C\u0627\u0632\u0629 \u0648\u062A\u0639\u0644\u064A\u0642 \u0627\u0644\u0645\u062A\u062C\u0631",
+        '\u0639\u0646\u062F \u062A\u0648\u0642\u0641 \u0627\u0644\u062A\u0627\u062C\u0631 \u0645\u0624\u0642\u062A\u0627\u064B \u0639\u0646 \u0627\u0644\u062A\u062C\u0647\u064A\u0632\u060C \u064A\u062C\u0628 \u062A\u0641\u0639\u064A\u0644 "\u0648\u0636\u0639 \u0627\u0644\u0625\u062C\u0627\u0632\u0629" \u0645\u0646 \u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0644\u0645\u062A\u062C\u0631 \u0644\u0625\u0628\u0644\u0627\u063A \u0627\u0644\u0639\u0645\u0644\u0627\u0621 \u0628\u0648\u0636\u0648\u062D. \u062A\u062D\u062A\u0641\u0638 \u0625\u062F\u0627\u0631\u0629 \u0646\u0627\u064A\u0644 \u0644\u064A\u0646\u0643 \u0628\u062D\u0642 \u062A\u0639\u0644\u064A\u0642 \u0623\u064A \u0645\u062A\u062C\u0631 \u0623\u0648 \u062A\u062C\u0645\u064A\u062F \u0627\u0644\u062A\u0633\u0648\u064A\u0627\u062A \u0627\u0644\u0645\u0631\u062A\u0628\u0637\u0629 \u0628\u0646\u0632\u0627\u0639\u0627\u062A \u0642\u0627\u0626\u0645\u0629 \u0641\u064A \u062D\u0627\u0644 \u0645\u062E\u0627\u0644\u0641\u0629 \u0627\u0644\u0633\u064A\u0627\u0633\u0627\u062A \u0623\u0648 \u0639\u0631\u0636 \u0633\u0644\u0639 \u0645\u0642\u0644\u062F\u0629.'
+      ].join("\n")
     }
   }
 ];
@@ -10990,11 +12960,26 @@ async function ensureEssentialSeed(db) {
       [tpl.key, JSON.stringify(tpl.subject), JSON.stringify(tpl.body)]
     );
   }
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString().slice(0, 19).replace("T", " ");
   for (const pg of ESSENTIAL_PAGES) {
     await db.execute(
       db.driver === "mysql" ? "INSERT IGNORE INTO pages (id, slug, title_json, body_json, published) VALUES (?, ?, ?, ?, 1)" : "INSERT OR IGNORE INTO pages (id, slug, title_json, body_json, published) VALUES (?, ?, ?, ?, 1)",
       [pg.id, pg.slug, JSON.stringify(pg.title), JSON.stringify(pg.body)]
     );
+    const existing = await db.queryOne(
+      "SELECT body_json FROM pages WHERE slug = ?",
+      [pg.slug]
+    );
+    if (existing) {
+      const parsedBody = typeof existing.body_json === "string" ? JSON.parse(existing.body_json) : existing.body_json;
+      const isLegacyDraft = String(parsedBody?.en || "").startsWith("Draft ") || String(parsedBody?.ar || "").startsWith("\u0645\u0633\u0648\u062F\u0629 ");
+      if (isLegacyDraft) {
+        await db.execute(
+          "UPDATE pages SET title_json = ?, body_json = ?, published = 1, updated_at = ? WHERE slug = ?",
+          [JSON.stringify(pg.title), JSON.stringify(pg.body), nowIso, pg.slug]
+        );
+      }
+    }
   }
   const menuCount = await db.queryOne("SELECT COUNT(*) as cnt FROM menus");
   if (!menuCount || Number(menuCount.cnt) === 0) {
@@ -11154,28 +13139,90 @@ function applySecurityHeaders(app, isDev) {
   });
 }
 
+// server/services/sitemapGenerator.ts
+init_marketplaceRepo();
+function escapeXml(raw) {
+  return String(raw).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+function normalizeBaseUrl(raw) {
+  const clean = (raw || process.env.APP_URL || "").trim().replace(/\/+$/, "");
+  if (clean && /^https?:\/\//i.test(clean)) return clean;
+  return "https://nilelink.lb";
+}
+function buildSitemapEntries(input) {
+  const base = normalizeBaseUrl(input.baseUrl);
+  const noindexSet = new Set(
+    (input.seo?.overrides || []).filter((o) => o.robots?.startsWith("noindex")).map((o) => `${o.entityType}:${o.entityKey}`)
+  );
+  const seen = /* @__PURE__ */ new Set();
+  const entries = [];
+  const addPath = (relPath, opts) => {
+    const normalizedPath = relPath.startsWith("/") ? relPath : `/${relPath}`;
+    const loc = `${base}${normalizedPath}`;
+    if (seen.has(loc)) return;
+    seen.add(loc);
+    entries.push({
+      loc,
+      lastmod: opts?.lastmod ? String(opts.lastmod).slice(0, 10) : void 0,
+      changefreq: opts?.changefreq,
+      priority: opts?.priority
+    });
+  };
+  if (!noindexSet.has("page:home")) addPath("/", { changefreq: "daily", priority: "1.0" });
+  if (!noindexSet.has("page:catalog")) addPath("/catalog", { changefreq: "daily", priority: "0.9" });
+  if (!noindexSet.has("page:stores")) addPath("/stores", { changefreq: "daily", priority: "0.8" });
+  if (!noindexSet.has("page:support")) addPath("/support", { changefreq: "monthly", priority: "0.6" });
+  if (!noindexSet.has("page:legal")) {
+    addPath("/legal?tab=terms", { changefreq: "monthly", priority: "0.4" });
+    addPath("/legal?tab=privacy", { changefreq: "monthly", priority: "0.4" });
+    addPath("/legal?tab=returns", { changefreq: "monthly", priority: "0.4" });
+    addPath("/legal?tab=seller", { changefreq: "monthly", priority: "0.4" });
+  }
+  addPath("/styleguide", { changefreq: "monthly", priority: "0.3" });
+  for (const c of input.campaigns) {
+    if (!c.slug || noindexSet.has(`campaign:${c.slug}`)) continue;
+    addPath(`/campaign/${encodeURIComponent(c.slug)}`, {
+      lastmod: c.endsAt || c.startsAt || c.createdAt || void 0,
+      changefreq: "daily",
+      priority: "0.8"
+    });
+  }
+  for (const s of input.sellers) {
+    if (!s.slug || noindexSet.has(`store:${s.slug}`)) continue;
+    addPath(`/store/${encodeURIComponent(s.slug)}`, {
+      lastmod: s.createdAt || void 0,
+      changefreq: "weekly",
+      priority: "0.8"
+    });
+  }
+  for (const p of input.products) {
+    if (!p.slug || noindexSet.has(`product:${p.slug}`)) continue;
+    addPath(`/product/${encodeURIComponent(p.slug)}`, {
+      lastmod: p.createdAt || void 0,
+      changefreq: "daily",
+      priority: "0.9"
+    });
+  }
+  return entries;
+}
+function generateSitemapXml(input) {
+  const entries = buildSitemapEntries(input);
+  const xmlBody = entries.map((e) => {
+    const lm = e.lastmod ? `<lastmod>${escapeXml(e.lastmod)}</lastmod>` : "";
+    const cf = e.changefreq ? `<changefreq>${e.changefreq}</changefreq>` : "";
+    const pr = e.priority ? `<priority>${e.priority}</priority>` : "";
+    return `  <url><loc>${escapeXml(e.loc)}</loc>${lm}${cf}${pr}</url>`;
+  }).join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${xmlBody}
+</urlset>
+`;
+}
+
 // server.ts
 init_security();
-
-// server/services/sms.ts
-var UnconfiguredSmsAdapter = class {
-  isConfigured() {
-    return Boolean((process.env.SMS_PROVIDER || "").trim() && (process.env.SMS_API_KEY || "").trim());
-  }
-  async sendOtp(_phone, _code) {
-    if (!this.isConfigured()) {
-      return {
-        sent: false,
-        reason: "Needs my input: configure SMS_PROVIDER and SMS_API_KEY in environment variables."
-      };
-    }
-    return {
-      sent: false,
-      reason: "External SMS gateway call requires production provider credentials."
-    };
-  }
-};
-var smsAdapter = new UnconfiguredSmsAdapter();
+init_sms();
 
 // server/services/storage.ts
 import crypto6 from "node:crypto";
@@ -11366,9 +13413,6 @@ function isSafeNavOrRelativeUrl(raw, allowRelative = true) {
   } catch {
     return false;
   }
-}
-function escapeXml(raw) {
-  return raw.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 }
 function escapeCsvCell(raw) {
   const s = String(raw ?? "");
@@ -11599,47 +13643,14 @@ async function createApp() {
         repo.getActiveCampaigns(),
         repo.getSeoMetadata()
       ]);
-      const base = resolvePublicBaseUrl(req, seo.global.canonicalBaseUrl);
-      const noindexSet = new Set(
-        seo.overrides.filter((o) => o.robots.startsWith("noindex")).map((o) => `${o.entityType}:${o.entityKey}`)
-      );
-      const entries = [];
-      const addPath = (p, lastmod) => {
-        entries.push({ loc: `${base}${p}`, lastmod });
-      };
-      if (!noindexSet.has("page:home")) addPath("/");
-      if (!noindexSet.has("page:catalog")) addPath("/catalog");
-      if (!noindexSet.has("page:support")) addPath("/support");
-      if (!noindexSet.has("page:legal")) {
-        addPath("/legal?tab=terms");
-        addPath("/legal?tab=privacy");
-        addPath("/legal?tab=returns");
-        addPath("/legal?tab=seller");
-      }
-      addPath("/styleguide");
-      for (const c of campaigns2) {
-        if (!noindexSet.has(`campaign:${c.slug}`)) {
-          addPath(`/campaign/${encodeURIComponent(c.slug)}`, c.endsAt || c.startsAt || void 0);
-        }
-      }
-      for (const s of sellers2) {
-        if (!noindexSet.has(`store:${s.slug}`)) {
-          addPath(`/store/${encodeURIComponent(s.slug)}`);
-        }
-      }
-      for (const p of products2) {
-        if (!noindexSet.has(`product:${p.slug}`)) {
-          addPath(`/product/${encodeURIComponent(p.slug)}`, p.createdAt);
-        }
-      }
-      const xmlBody = entries.map((e) => {
-        const lm = e.lastmod ? `<lastmod>${escapeXml(String(e.lastmod).slice(0, 10))}</lastmod>` : "";
-        return `  <url><loc>${escapeXml(e.loc)}</loc>${lm}</url>`;
-      }).join("\n");
-      const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-${xmlBody}
-</urlset>`;
+      const baseUrl = resolvePublicBaseUrl(req, seo.global.canonicalBaseUrl);
+      const xml = generateSitemapXml({
+        baseUrl,
+        products: products2,
+        sellers: sellers2,
+        campaigns: campaigns2,
+        seo
+      });
       res.type("application/xml").send(xml);
     } catch (err) {
       next(err);
@@ -11879,6 +13890,9 @@ ${xmlBody}
           roleKey: req.authUser.roleKey,
           sellerId: req.authUser.sellerId,
           totpEnabled: req.authUser.totpEnabled,
+          emailVerifiedAt: req.authUser.emailVerifiedAt,
+          phoneVerifiedAt: req.authUser.phoneVerifiedAt,
+          isFullyVerified: req.authUser.isFullyVerified,
           preferredLocale: req.authUser.preferredLocale,
           preferredCurrency: req.authUser.preferredCurrency,
           permissions: req.authUser.permissions
@@ -11904,17 +13918,27 @@ ${xmlBody}
       const ses = await createSession(db, user.id, req);
       setSessionCookies(req, res, ses.rawToken, ses.csrfToken);
       res.status(201).json({
-        user: { ...user, totpEnabled: false, preferredLocale: body.locale || "en", preferredCurrency: "USD", permissions: [] }
+        user: {
+          ...user,
+          totpEnabled: false,
+          emailVerifiedAt: null,
+          phoneVerifiedAt: null,
+          isFullyVerified: false,
+          preferredLocale: body.locale || "en",
+          preferredCurrency: "USD",
+          permissions: []
+        }
       });
     } catch (err) {
       res.status(400).json({ error: err.message });
     }
   });
   const LoginSchema = z.object({
-    email: z.string().email(),
+    identifier: z.string().min(3).max(190).optional(),
+    email: z.string().min(3).max(190).optional(),
     password: z.string().min(1),
     totpCode: z.string().optional()
-  });
+  }).refine((d) => Boolean((d.identifier || d.email || "").trim()), "Email or phone number is required.");
   app.post("/api/auth/login", rateLimit(20, 6e4), async (req, res) => {
     try {
       const body = validateBody(LoginSchema, req.body);
@@ -11958,8 +13982,31 @@ ${xmlBody}
   });
   app.post("/api/auth/forgot-password", rateLimit(10, 6e4), async (req, res) => {
     try {
-      const { email } = validateBody(z.object({ email: z.string().email().max(180) }), req.body);
-      const result = await repo.requestPasswordReset(email, getClientIp(req));
+      const body = validateBody(
+        z.object({
+          identifier: z.string().min(3).max(190).optional(),
+          email: z.string().min(3).max(190).optional(),
+          channel: z.enum(["email", "sms"]).optional()
+        }).refine((d) => Boolean((d.identifier || d.email || "").trim()), "Email or phone number is required."),
+        req.body
+      );
+      const result = await repo.requestPasswordResetOtp(body, getClientIp(req));
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+  app.post("/api/auth/forgot-password/verify-otp", rateLimit(15, 6e4), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          identifier: z.string().min(3).max(190),
+          code: z.string().min(4).max(12),
+          channel: z.enum(["email", "sms"]).optional()
+        }),
+        req.body
+      );
+      const result = await repo.verifyPasswordResetOtp(body, getClientIp(req));
       res.json(result);
     } catch (err) {
       res.status(400).json({ error: err.message });
@@ -11978,6 +14025,118 @@ ${xmlBody}
       res.json(result);
     } catch (err) {
       res.status(400).json({ error: err.message });
+    }
+  });
+  app.post("/api/auth/verification/send", requireAuth, rateLimit(10, 6e4), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          channel: z.enum(["email", "phone"]),
+          target: z.string().max(190).optional()
+        }),
+        req.body
+      );
+      const result = await repo.requestAuthVerificationOtp(req.authUser.id, body, getClientIp(req));
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+  app.post("/api/auth/verification/confirm", requireAuth, rateLimit(15, 6e4), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          channel: z.enum(["email", "phone"]),
+          code: z.string().min(4).max(12)
+        }),
+        req.body
+      );
+      const result = await repo.confirmAuthVerificationOtp(req.authUser.id, body, getClientIp(req));
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+  app.post("/api/auth/otp/request", rateLimit(10, 6e4), async (req, res) => {
+    try {
+      const body = validateBody(z.object({ identifier: z.string().min(3).max(190) }), req.body);
+      const result = await repo.requestLoginOtp(body.identifier, getClientIp(req));
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+  app.post("/api/auth/otp/verify", rateLimit(15, 6e4), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          identifier: z.string().min(3).max(190),
+          code: z.string().min(4).max(12),
+          totpCode: z.string().optional()
+        }),
+        req.body
+      );
+      const logged = await repo.verifyLoginOtp(body, getClientIp(req));
+      const ses = await rotateSession(db, req.authUser?.sessionId, logged.id, req);
+      setSessionCookies(req, res, ses.rawToken, ses.csrfToken);
+      const fullUser = await getSessionUser(db, ses.rawToken);
+      res.json({ user: fullUser });
+    } catch (err) {
+      res.status(401).json({ error: err.message });
+    }
+  });
+  app.get("/api/chat/conversations", requireAuth, async (req, res, next) => {
+    try {
+      const sellerFilter = req.query.sellerId ? String(req.query.sellerId) : void 0;
+      const conversations = await repo.listChatConversations(req.authUser, sellerFilter);
+      res.json({ conversations });
+    } catch (err) {
+      next(err);
+    }
+  });
+  app.post("/api/chat/conversations", requireAuth, rateLimit(30, 6e4), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          sellerId: z.string().min(1).max(64),
+          productId: z.string().max(64).optional(),
+          body: z.string().min(1).max(2e3)
+        }),
+        req.body
+      );
+      const result = await repo.startOrSendChatConversation(req.authUser, body);
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+  app.get("/api/chat/conversations/:id/messages", requireAuth, async (req, res) => {
+    try {
+      const data = await repo.getChatConversationMessages(req.params.id, req.authUser);
+      res.json(data);
+    } catch (err) {
+      const msg = err.message;
+      res.status(msg.startsWith("Forbidden") ? 403 : 404).json({ error: msg });
+    }
+  });
+  app.post("/api/chat/conversations/:id/messages", requireAuth, rateLimit(40, 6e4), async (req, res) => {
+    try {
+      const { body } = validateBody(z.object({ body: z.string().min(1).max(2e3) }), req.body);
+      const message = await repo.sendChatMessage(req.params.id, req.authUser, body);
+      res.status(201).json({ message });
+    } catch (err) {
+      const msg = err.message;
+      res.status(msg.startsWith("Forbidden") ? 403 : 400).json({ error: msg });
+    }
+  });
+  app.patch("/api/chat/conversations/:id", requireAuth, async (req, res) => {
+    try {
+      const { status } = validateBody(z.object({ status: z.enum(["open", "closed"]) }), req.body);
+      await repo.updateChatConversationStatus(req.params.id, req.authUser, status);
+      res.json({ ok: true });
+    } catch (err) {
+      const msg = err.message;
+      res.status(msg.startsWith("Forbidden") ? 403 : 400).json({ error: msg });
     }
   });
   app.get("/api/admin/auth-status", async (_req, res, next) => {
@@ -12063,11 +14222,41 @@ ${xmlBody}
       next(err);
     }
   });
+  app.get("/api/account/wishlist", requireAuth, async (req, res, next) => {
+    try {
+      const wishlist = await repo.getUserWishlist(req.authUser.id);
+      res.json({ wishlist });
+    } catch (err) {
+      next(err);
+    }
+  });
+  app.put("/api/account/wishlist", requireAuth, async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          productIds: z.array(z.string().min(1).max(80)).max(200)
+        }),
+        req.body
+      );
+      const wishlist = await repo.syncUserWishlist(req.authUser.id, body.productIds);
+      res.json({ wishlist });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
   app.post("/api/account/wishlist/toggle", requireAuth, async (req, res) => {
     try {
-      const body = validateBody(z.object({ productId: z.string().min(1) }), req.body);
+      const body = validateBody(z.object({ productId: z.string().min(1).max(80) }), req.body);
       const result = await repo.toggleUserWishlist(req.authUser.id, body.productId);
       res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+  app.delete("/api/account/wishlist/:productId", requireAuth, async (req, res) => {
+    try {
+      const wishlist = await repo.removeUserWishlistItem(req.authUser.id, req.params.productId);
+      res.json({ wishlist });
     } catch (err) {
       res.status(400).json({ error: err.message });
     }
@@ -12146,7 +14335,12 @@ ${xmlBody}
   });
   app.get("/api/account/notifications", requireAuth, async (req, res, next) => {
     try {
-      res.json({ notifications: await repo.getUserNotifications(req.authUser.id) });
+      const [notifications2, preferences] = await Promise.all([
+        repo.getUserNotifications(req.authUser.id),
+        repo.getNotificationPreferences(req.authUser.id)
+      ]);
+      const unreadCount = notifications2.filter((n) => !n.readAt).length;
+      res.json({ notifications: notifications2, unreadCount, preferences });
     } catch (err) {
       next(err);
     }
@@ -12155,6 +14349,39 @@ ${xmlBody}
     try {
       const result = await repo.markNotificationRead(req.authUser.id, req.params.id);
       res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+  app.patch("/api/account/notifications/preferences", requireAuth, async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          emailSummaryEnabled: z.boolean().optional(),
+          summaryFrequency: z.enum(["instant", "daily", "weekly", "off"]).optional(),
+          orderUpdates: z.boolean().optional(),
+          priceDrops: z.boolean().optional(),
+          promotionalOffers: z.boolean().optional()
+        }),
+        req.body
+      );
+      const preferences = await repo.updateNotificationPreferences(req.authUser.id, body);
+      res.json({ preferences });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+  app.post("/api/account/notifications/email-summary", requireAuth, rateLimit(5, 6e4), async (req, res) => {
+    try {
+      const summary = await sendNotificationSummaryForUser(db, req.authUser.id, { force: true });
+      res.json({
+        ok: summary.ok,
+        sentCount: summary.sentCount,
+        status: summary.status,
+        error: summary.error || null,
+        previewSubject: summary.previewSubject,
+        lastSummarySentAt: summary.lastSummarySentAt
+      });
     } catch (err) {
       res.status(400).json({ error: err.message });
     }
@@ -12373,6 +14600,8 @@ ${xmlBody}
       if (!sellerId) return res.status(400).json({ error: "Seller ID required." });
       const body = validateBody(
         z.object({
+          nameEn: z.string().min(2).max(160).optional(),
+          nameAr: z.string().min(2).max(160).optional(),
           taglineEn: z.string().max(190).optional(),
           taglineAr: z.string().max(190).optional(),
           aboutEn: z.string().max(2e3).optional(),
@@ -12383,6 +14612,7 @@ ${xmlBody}
           returnPolicyAr: z.string().max(1200).optional(),
           processingHours: z.number().int().min(1).max(360).optional(),
           vacationMode: z.boolean().optional(),
+          workingHours: z.record(z.string().max(32), z.string().max(80)).optional(),
           seoTitle: z.string().max(160).optional(),
           seoDescription: z.string().max(320).optional(),
           storefrontTheme: z.enum(["obsidian-ember", "sand-atelier", "cyan-lab", "sage-studio"]).optional(),
@@ -12390,7 +14620,16 @@ ${xmlBody}
           selfDeliveryFeesUsdCents: z.record(z.string(), z.number().int().min(0).max(5e4)).optional(),
           payoutMethod: z.enum(["whish", "omt", "bank"]).optional(),
           payoutAccount: z.string().min(3).max(180).optional(),
+          phone: z.string().min(6).max(40).optional(),
           whatsappPhone: z.string().min(6).max(40).optional(),
+          communicationPrefs: z.object({
+            whatsappEnabled: z.boolean(),
+            whatsappGreeting: z.string().max(300).optional(),
+            systemChatEnabled: z.boolean(),
+            phoneCallsEnabled: z.boolean(),
+            preferredChannel: z.enum(["whatsapp", "system_chat", "phone"])
+          }).optional(),
+          cityAddress: z.string().max(255).optional(),
           bannerMediaId: z.string().optional(),
           logoMediaId: z.string().optional(),
           locations: z.array(
@@ -12673,6 +14912,18 @@ ${xmlBody}
     } catch (err) {
       res.status(400).json({ error: err.message });
     }
+  });
+  app.get("/api/admin/session", requireAdminPerm(), async (req, res) => {
+    res.json({
+      authorized: true,
+      user: {
+        id: req.authUser.id,
+        name: req.authUser.name,
+        email: req.authUser.email,
+        roleKey: req.authUser.roleKey,
+        permissions: req.authUser.permissions
+      }
+    });
   });
   app.get("/api/admin/overview", requireAdminPerm(), async (_req, res, next) => {
     try {
@@ -13126,12 +15377,24 @@ ${xmlBody}
       res.status(400).json({ error: err.message });
     }
   });
+  app.get("/api/admin/users/:id/activity", requireAdminPerm("users.manage"), async (req, res) => {
+    try {
+      const activity = await repo.getAdminUserActivity(req.params.id);
+      res.json(activity);
+    } catch (err) {
+      res.status(404).json({ error: err.message });
+    }
+  });
   app.patch("/api/admin/users/:id/access", requireAdminPerm("users.manage"), async (req, res) => {
     try {
       const body = validateBody(
         z.object({
           isBlocked: z.boolean().optional(),
-          permissions: z.array(z.string().min(1).max(80)).optional()
+          verifyEmail: z.boolean().optional(),
+          verifyPhone: z.boolean().optional(),
+          roleKey: z.enum(["customer", "seller_owner", "seller_staff", "admin_staff"]).optional(),
+          permissions: z.array(z.string().min(1).max(80)).optional(),
+          reason: z.string().max(300).optional()
         }),
         req.body
       );
@@ -13307,6 +15570,7 @@ ${xmlBody}
       const body = validateBody(
         z.object({
           chrome: z.object({
+            brandLogoUrl: z.string().max(500).refine((v) => !v || isSafeNavOrRelativeUrl(v), "Unsafe logo URL").nullable().optional(),
             headerLinks: z.array(
               z.object({
                 id: z.string().min(1),

@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
-import { ChevronDown, Globe, LogOut, Moon, ShoppingBag, Sun, User, X } from 'lucide-react';
-import type { Locale, SiteChromeSettings, ThemeMode } from '../shared/types.ts';
+import React, { useEffect, useRef, useState } from 'react';
+import { Bell, Check, ChevronDown, Globe, Heart, LogOut, Mail, Moon, Search, ShoppingBag, Sun, User, X } from 'lucide-react';
+import type { Locale, NotificationCategory, SiteChromeSettings, ThemeMode } from '../shared/types.ts';
 import { getCopy } from '../shared/i18n.ts';
 import { useMarketplace } from '../context/MarketplaceContext.tsx';
 import { safeNavigateOrOpen } from '../utils/url.ts';
@@ -32,15 +32,42 @@ export function Header({
     navigate,
     settings,
     cart,
+    wishlist,
     setIsCartOpen,
+    setIsSearchOpen,
     authUser,
     logout,
+    notifications,
     unreadNotificationsCount,
+    markNotificationRead,
+    sendNotificationEmailSummary,
   } = ctx;
 
   const [bannerDismissed, setBannerDismissed] = useState(false);
   const [dismissedTopBarIds, setDismissedTopBarIds] = useState<string[]>([]);
   const [megaOpen, setMegaOpen] = useState(false);
+  const [bellOpen, setBellOpen] = useState(false);
+  const [bellCategory, setBellCategory] = useState<'all' | NotificationCategory>('all');
+  const [emailSummaryBusy, setEmailSummaryBusy] = useState(false);
+  const bellRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!bellOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (bellRef.current && !bellRef.current.contains(e.target as Node)) {
+        setBellOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setBellOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [bellOpen]);
   const bagCount = cart.reduce((sum, item) => sum + item.quantity, 0);
   const announcementText = settings.announcement?.[locale]?.trim() || '';
 
@@ -55,7 +82,19 @@ export function Header({
   const isActive = (path: string) => !previewMode && route.startsWith(path);
   const safeNavigate = (to: string) => {
     setMegaOpen(false);
+    setBellOpen(false);
     if (!previewMode) safeNavigateOrOpen(to, navigate, '/');
+  };
+
+  const filteredBellItems = notifications.filter((n) =>
+    bellCategory === 'all' ? true : (n.category || 'system') === bellCategory
+  );
+
+  const categoryLabel = (cat?: NotificationCategory) => {
+    if (cat === 'order') return locale === 'ar' ? 'طلب' : 'Order';
+    if (cat === 'price_drop') return locale === 'ar' ? 'تخفيض' : 'Price Drop';
+    if (cat === 'promo') return locale === 'ar' ? 'عرض' : 'Offer';
+    return locale === 'ar' ? 'تنبيه' : 'Update';
   };
 
   return (
@@ -146,6 +185,24 @@ export function Header({
                 <span className="hidden sm:inline text-[var(--line)]" aria-hidden="true">|</span>
                 {authUser ? (
                   <>
+                    {(authUser.roleKey === 'admin_super' || authUser.roleKey === 'admin_staff') && (
+                      <button
+                        type="button"
+                        onClick={() => safeNavigate('/admin')}
+                        className="hidden sm:inline-flex items-center text-[var(--cyan)] hover:text-[var(--ember)] whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        {t.navAdmin}
+                      </button>
+                    )}
+                    {(authUser.roleKey === 'seller_owner' || authUser.roleKey === 'seller_staff') && (
+                      <button
+                        type="button"
+                        onClick={() => safeNavigate('/seller')}
+                        className="hidden sm:inline-flex items-center text-[var(--ember)] hover:underline whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        {t.navSell}
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => safeNavigate('/account')}
@@ -245,9 +302,17 @@ export function Header({
           <button
             type="button"
             onClick={() => safeNavigate('/')}
-            className="font-display text-2xl font-bold text-[var(--bone)] hover:text-[var(--ember)] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            className="inline-flex items-center gap-2 font-display text-2xl font-bold text-[var(--bone)] hover:text-[var(--ember)] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            {t.brand}
+            {chrome.brandLogoUrl && (
+              <img
+                src={chrome.brandLogoUrl}
+                alt={t.brand}
+                referrerPolicy="no-referrer"
+                className="h-7 w-7 object-contain border border-[var(--line)] bg-[var(--graphite)] p-0.5"
+              />
+            )}
+            <span>{t.brand}</span>
           </button>
 
           {chrome.showMegaMenu && chrome.megaMenuDepartments.length > 0 && (
@@ -278,7 +343,177 @@ export function Header({
           ))}
         </nav>
 
-        <div className="shrink-0">
+        <div className="shrink-0 flex items-center gap-2">
+          {!previewMode && (
+            <button
+              type="button"
+              onClick={() => setIsSearchOpen(true)}
+              aria-label={locale === 'ar' ? 'فتح البحث الشامل (Ctrl+K)' : 'Open global search (Ctrl+K)'}
+              title={locale === 'ar' ? 'بحث شامل (Ctrl+K)' : 'Search Marketplace (Ctrl+K)'}
+              className="inline-flex items-center gap-2 px-2.5 py-2 text-xs border border-[var(--line)] text-[var(--bone)] hover:border-[var(--ember)] hover:text-[var(--ember)] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Search className="w-3.5 h-3.5" aria-hidden="true" />
+              <span className="hidden lg:inline">{t.searchBtn}</span>
+              <span className="hidden lg:inline font-mono-tabular text-[10px] text-[var(--muted)] border border-[var(--line)] px-1">
+                ⌘K
+              </span>
+            </button>
+          )}
+          {!previewMode && authUser && (
+            <div ref={bellRef} className="relative">
+              <button
+                type="button"
+                onClick={() => setBellOpen((o) => !o)}
+                aria-expanded={bellOpen}
+                aria-haspopup="dialog"
+                aria-label={
+                  locale === 'ar'
+                    ? `الإشعارات (${unreadNotificationsCount} غير مقروء)`
+                    : `Notifications (${unreadNotificationsCount} unread)`
+                }
+                title={t.notifications}
+                className="inline-flex items-center gap-1.5 px-2.5 py-2 text-xs font-mono-tabular border border-[var(--line)] text-[var(--bone)] hover:border-[var(--ember)] hover:text-[var(--ember)] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Bell
+                  className={`w-3.5 h-3.5 ${unreadNotificationsCount > 0 ? 'text-[var(--ember)]' : ''}`}
+                  aria-hidden="true"
+                />
+                <span>{unreadNotificationsCount}</span>
+              </button>
+
+              {bellOpen && (
+                <div
+                  role="dialog"
+                  aria-label={t.notifications}
+                  className="absolute end-0 mt-2 w-[340px] sm:w-[390px] border border-[var(--line)] bg-[var(--graphite)] text-[var(--bone)] z-50 shadow-2xl"
+                >
+                  <div className="px-4 py-3 border-b border-[var(--line)] bg-[var(--ink)] flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <Bell className="w-3.5 h-3.5 text-[var(--ember)]" aria-hidden="true" />
+                      <span className="text-xs font-semibold uppercase tracking-wider">{t.notifications}</span>
+                      {unreadNotificationsCount > 0 && (
+                        <span className="font-mono-tabular text-[11px] text-[var(--ember)] font-bold">
+                          · {unreadNotificationsCount}
+                        </span>
+                      )}
+                    </div>
+                    {unreadNotificationsCount > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => void markNotificationRead('all')}
+                        className="text-[11px] text-[var(--cedar)] hover:underline inline-flex items-center gap-1 cursor-pointer"
+                      >
+                        <Check className="w-3 h-3" aria-hidden="true" />
+                        <span>{t.bellMarkAllRead}</span>
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="px-3 py-2 border-b border-[var(--line)] flex items-center gap-1.5 overflow-x-auto">
+                    {(
+                      [
+                        ['all', t.bellAll],
+                        ['order', t.bellOrders],
+                        ['price_drop', t.bellPriceDrops],
+                        ['promo', t.bellOffers],
+                      ] as const
+                    ).map(([catKey, label]) => (
+                      <button
+                        key={catKey}
+                        type="button"
+                        onClick={() => setBellCategory(catKey)}
+                        className={`px-2 py-0.5 text-[11px] border whitespace-nowrap shrink-0 cursor-pointer ${
+                          bellCategory === catKey
+                            ? 'border-[var(--ember)] bg-[var(--ember)] text-[var(--ember-fg)] font-semibold'
+                            : 'border-[var(--line)] text-[var(--muted)] hover:text-[var(--bone)]'
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="max-h-72 overflow-y-auto divide-y divide-[var(--line)]">
+                    {filteredBellItems.length === 0 ? (
+                      <div className="p-6 text-center text-xs text-[var(--muted)]">{t.bellEmpty}</div>
+                    ) : (
+                      filteredBellItems.slice(0, 12).map((n) => (
+                        <button
+                          key={n.id}
+                          type="button"
+                          onClick={() => {
+                            if (!n.readAt) void markNotificationRead(n.id);
+                            safeNavigate(n.actionUrl || '/account?tab=notifications');
+                          }}
+                          className={`w-full text-start px-4 py-3 space-y-1 hover:bg-[var(--ink)] transition-colors cursor-pointer ${
+                            !n.readAt ? 'bg-[var(--ink)]/50 border-s-2 border-s-[var(--ember)]' : 'opacity-80'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2 text-[10px] font-mono-tabular uppercase">
+                            <span
+                              className={
+                                n.category === 'price_drop'
+                                  ? 'text-[var(--cedar)] font-semibold'
+                                  : n.category === 'promo'
+                                    ? 'text-[var(--ember)] font-semibold'
+                                    : n.category === 'order'
+                                      ? 'text-[var(--cyan)] font-semibold'
+                                      : 'text-[var(--muted)]'
+                              }
+                            >
+                              {categoryLabel(n.category)}
+                            </span>
+                            <span className="text-[var(--muted)]">{n.createdAt.slice(0, 10)}</span>
+                          </div>
+                          <p className="text-xs font-semibold text-[var(--bone)] line-clamp-1">
+                            {n.title[locale] || n.title.en}
+                          </p>
+                          <p className="text-[11px] text-[var(--muted)] line-clamp-2">
+                            {n.body[locale] || n.body.en}
+                          </p>
+                        </button>
+                      ))
+                    )}
+                  </div>
+
+                  <div className="px-3 py-2.5 border-t border-[var(--line)] bg-[var(--ink)] flex items-center justify-between gap-2">
+                    <button
+                      type="button"
+                      disabled={emailSummaryBusy}
+                      onClick={async () => {
+                        setEmailSummaryBusy(true);
+                        await sendNotificationEmailSummary();
+                        setEmailSummaryBusy(false);
+                      }}
+                      className="inline-flex items-center gap-1.5 border border-[var(--line)] px-2.5 py-1 text-[11px] text-[var(--bone)] hover:border-[var(--ember)] cursor-pointer disabled:opacity-50"
+                    >
+                      <Mail className="w-3 h-3 text-[var(--ember)]" aria-hidden="true" />
+                      <span>{t.bellSendSummary}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => safeNavigate('/account?tab=notifications')}
+                      className="text-[11px] font-medium text-[var(--ember)] hover:underline cursor-pointer"
+                    >
+                      {t.bellManagePrefs}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+          {!previewMode && (
+            <button
+              type="button"
+              onClick={() => safeNavigate('/catalog?wishlist=true')}
+              aria-label={locale === 'ar' ? `المفضلة (${wishlist.length})` : `Wishlist (${wishlist.length})`}
+              title={locale === 'ar' ? 'المفضلة' : 'Wishlist'}
+              className="inline-flex items-center gap-1.5 px-2.5 py-2 text-xs font-mono-tabular border border-[var(--line)] text-[var(--bone)] hover:border-[var(--ember)] hover:text-[var(--ember)] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Heart className={`w-3.5 h-3.5 ${wishlist.length > 0 ? 'fill-[var(--ember)] text-[var(--ember)]' : ''}`} aria-hidden="true" />
+              <span>{wishlist.length}</span>
+            </button>
+          )}
           <button
             type="button"
             onClick={() => !previewMode && setIsCartOpen(true)}

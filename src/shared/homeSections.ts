@@ -690,6 +690,7 @@ export function normalizeTargeting(raw: unknown, legacyAudience?: string): HomeS
 }
 
 export const DEFAULT_SITE_CHROME: SiteChromeSettings = {
+  brandLogoUrl: '',
   headerLinks: [
     { id: 'nav-catalog', label: { en: 'Catalog', ar: 'الكتالوج' }, url: '/catalog', visible: true },
     { id: 'nav-orders', label: { en: 'My Orders', ar: 'طلباتي' }, url: '/orders', visible: true },

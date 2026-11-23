@@ -4,6 +4,7 @@ import type {
   AuditLogEntry,
   AutomationFlow,
   AutomationTriggerType,
+  AdminUserActivityPayload,
   BannerBgToken,
   BannerPageScope,
   BannerPlacementType,
@@ -11,8 +12,11 @@ import type {
   Campaign,
   CampaignStatus,
   Category,
+  ChatConversation,
+  ChatMessage,
   Coupon,
   CouponDiscountType,
+  Currency,
   CustomerAddress,
   CustomerSegment,
   CustomerSegmentRule,
@@ -41,13 +45,16 @@ import type {
   HomeSectionVersion,
   LedgerEntry,
   LocalizedText,
+  Locale,
   MarketingAudienceType,
   MarketingAnalyticsSummary,
   MarketingPopup,
   MediaAsset,
   MenuConfig,
   NewsletterSubscriber,
+  NotificationCategory,
   NotificationItem,
+  NotificationPreferences,
   Offer,
   OfferApprovalStatus,
   OfferBanner,
@@ -76,6 +83,7 @@ import type {
   Review,
   SegmentContact,
   Seller,
+  SellerCommunicationPrefs,
   SellerDocumentReview,
   SellerPromoRules,
   SellerStaffMember,
@@ -107,7 +115,10 @@ import { parseNaturalQuery } from '../searchParser.ts';
 import {
   buildOtpAuthUri,
   generateTotpSecret,
+  hashOtpCode,
   hashPassword,
+  isAdminRole,
+  normalizePhoneNumber,
   sha256Hex,
   timingSafeStringMatch,
   toSqlTimestamp,
@@ -117,7 +128,8 @@ import {
   writeAuditLog,
   type AuthContextUser,
 } from '../services/security.ts';
-import { queueEmail, type MarketingEmailJobPayload } from '../services/email.ts';
+import { emailAdapter, queueEmail, type MarketingEmailJobPayload } from '../services/email.ts';
+import { smsAdapter } from '../services/sms.ts';
 import { enqueueJob, releaseEligibleEscrowHolds } from '../services/jobs.ts';
 
 function parseJson<T>(val: unknown, fallback: T): T {
@@ -376,9 +388,23 @@ export class MarketplaceRepo {
     if (pwErr) throw new Error(pwErr);
 
     const emailNorm = input.email.trim().toLowerCase();
+    const phoneNorm = normalizePhoneNumber(input.phone);
+    if (!phoneNorm || phoneNorm.length < 7) {
+      throw new Error('Please provide a valid Lebanese or international phone number.');
+    }
+
     return this.db.transaction(async (tx) => {
-      const dup = await tx.queryOne<{ id: string }>('SELECT id FROM users WHERE LOWER(email) = ?', [emailNorm]);
+      const dup = await tx.queryOne<{ id: string }>(
+        'SELECT id FROM users WHERE LOWER(email) = ? AND deleted_at IS NULL',
+        [emailNorm]
+      );
       if (dup) throw new Error('An account with this email already exists.');
+
+      const dupPhone = await tx.queryOne<{ id: string }>(
+        'SELECT id FROM users WHERE phone = ? AND deleted_at IS NULL',
+        [phoneNorm]
+      );
+      if (dupPhone) throw new Error('An account with this phone number already exists.');
 
       const id = `usr-${crypto.randomUUID()}`;
       const now = toSqlTimestamp();
@@ -386,7 +412,7 @@ export class MarketplaceRepo {
       await tx.execute(
         `INSERT INTO users (id, name, email, phone, password_hash, role_key, preferred_locale, preferred_currency, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, 'customer', ?, 'USD', ?, ?)`,
-        [id, input.name.trim(), emailNorm, input.phone.trim(), hashPassword(input.password), locale, now, now]
+        [id, input.name.trim(), emailNorm, phoneNorm, hashPassword(input.password), locale, now, now]
       );
 
       await queueEmail(tx, {
@@ -404,13 +430,44 @@ export class MarketplaceRepo {
         ipAddress: input.ipAddress,
       });
 
-      return { id, name: input.name.trim(), email: emailNorm, phone: input.phone.trim(), roleKey: 'customer' as const };
+      return {
+        id,
+        name: input.name.trim(),
+        email: emailNorm,
+        phone: phoneNorm,
+        roleKey: 'customer' as const,
+        emailVerifiedAt: null,
+        phoneVerifiedAt: null,
+        isFullyVerified: false,
+      };
     });
   }
 
-  async loginUser(input: { email: string; password: string; totpCode?: string; ipAddress?: string }) {
-    const emailNorm = input.email.trim().toLowerCase();
-    const row = await this.db.queryOne<{
+  private async findUserByIdentifier(identifier: string) {
+    const clean = identifier.trim();
+    if (!clean) return null;
+    if (clean.includes('@')) {
+      return this.db.queryOne<{
+        id: string;
+        name: string;
+        email: string;
+        phone: string;
+        password_hash: string;
+        role_key: string;
+        totp_secret: string | null;
+        totp_enabled: number | boolean;
+        email_verified_at: string | null;
+        phone_verified_at: string | null;
+        preferred_locale: string;
+        failed_login_attempts: number;
+        locked_until: string | null;
+        is_blocked: number | boolean;
+        deleted_at: string | null;
+      }>('SELECT * FROM users WHERE LOWER(email) = ? AND deleted_at IS NULL LIMIT 1', [clean.toLowerCase()]);
+    }
+    const phoneNorm = normalizePhoneNumber(clean);
+    const digitsTail = phoneNorm.replace(/[^\d]/g, '').slice(-8);
+    return this.db.queryOne<{
       id: string;
       name: string;
       email: string;
@@ -419,14 +476,31 @@ export class MarketplaceRepo {
       role_key: string;
       totp_secret: string | null;
       totp_enabled: number | boolean;
+      email_verified_at: string | null;
+      phone_verified_at: string | null;
+      preferred_locale: string;
       failed_login_attempts: number;
       locked_until: string | null;
       is_blocked: number | boolean;
       deleted_at: string | null;
-    }>('SELECT * FROM users WHERE LOWER(email) = ? LIMIT 1', [emailNorm]);
+    }>(
+      `SELECT * FROM users
+       WHERE deleted_at IS NULL
+         AND (phone = ? OR phone = ? OR (? != '' AND REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '+', '') LIKE ?))
+       LIMIT 1`,
+      [phoneNorm, clean, digitsTail, `%${digitsTail}`]
+    );
+  }
+
+  async loginUser(input: { identifier?: string; email?: string; password: string; totpCode?: string; ipAddress?: string }) {
+    const rawId = (input.identifier || input.email || '').trim();
+    if (!rawId) {
+      throw new Error('Email or phone number is required.');
+    }
+    const row = await this.findUserByIdentifier(rawId);
 
     if (!row || row.deleted_at) {
-      throw new Error('Invalid email or password.');
+      throw new Error('Invalid email/phone or password.');
     }
     if (row.is_blocked) {
       throw new Error('Account suspended. Contact NileLink support.');
@@ -443,7 +517,7 @@ export class MarketplaceRepo {
         'UPDATE users SET failed_login_attempts = ?, locked_until = ? WHERE id = ?',
         [nextAttempts, lockedUntil, row.id]
       );
-      throw new Error('Invalid email or password.');
+      throw new Error('Invalid email/phone or password.');
     }
 
     const requiresTotp = row.role_key === 'admin_super' || row.role_key === 'admin_staff' || Boolean(row.totp_enabled);
@@ -483,6 +557,391 @@ export class MarketplaceRepo {
     }
     await this.db.execute('UPDATE users SET totp_enabled = 1 WHERE id = ?', [userId]);
     return { totpEnabled: true };
+  }
+
+  private async dispatchOtpChallenge(
+    tx: DbTx,
+    input: {
+      userId: string;
+      userName: string;
+      channel: 'email' | 'phone';
+      target: string;
+      purpose: 'verify_contact' | 'login_otp' | 'password_reset_otp';
+      locale: 'en' | 'ar';
+    }
+  ): Promise<{ code: string; deliveryConfigured: boolean }> {
+    const code = String(crypto.randomInt(100000, 1000000));
+    const now = toSqlTimestamp();
+    const expiresAt = toSqlTimestamp(new Date(Date.now() + 10 * 60_000));
+    const codeHash = hashOtpCode(input.userId, input.channel, input.purpose, code);
+
+    // Invalidate prior active OTP codes for same user/channel/purpose
+    await tx.execute(
+      'UPDATE verification_codes SET consumed_at = ? WHERE user_id = ? AND channel = ? AND purpose = ? AND consumed_at IS NULL',
+      [now, input.userId, input.channel, input.purpose]
+    );
+
+    await tx.execute(
+      `INSERT INTO verification_codes (id, user_id, channel, target, purpose, code_hash, attempts, expires_at, consumed_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, ?)`,
+      [`vcd-${crypto.randomUUID()}`, input.userId, input.channel, input.target, input.purpose, codeHash, expiresAt, now]
+    );
+
+    let deliveryConfigured = false;
+    if (input.channel === 'email') {
+      deliveryConfigured = emailAdapter.isConfigured();
+      const isReset = input.purpose === 'password_reset_otp';
+      const subject =
+        input.locale === 'ar'
+          ? isReset
+            ? `رمز إعادة تعيين كلمة المرور في نايل لينك: ${code}`
+            : `رمز التحقق الخاص بك في نايل لينك: ${code}`
+          : isReset
+            ? `Your NileLink password reset code: ${code}`
+            : `Your NileLink verification code: ${code}`;
+      const text =
+        input.locale === 'ar'
+          ? isReset
+            ? `مرحباً ${input.userName}،\nرمز إعادة تعيين كلمة المرور الخاص بك هو: ${code}\nصالح لمدة 10 دقائق. لا تشارك هذا الرمز مع أي شخص.`
+            : `مرحباً ${input.userName}،\nرمز التحقق الخاص بك هو: ${code}\nصالح لمدة 10 دقائق.`
+          : isReset
+            ? `Hello ${input.userName},\nYour NileLink password reset verification code is: ${code}\nIt expires in 10 minutes. Never share this code.`
+            : `Hello ${input.userName},\nYour NileLink verification code is: ${code}\nIt expires in 10 minutes.`;
+      const sent = deliveryConfigured ? await emailAdapter.send({ to: input.target, subject, text }) : { ok: false };
+      const templateKey =
+        input.purpose === 'login_otp'
+          ? 'otp_login'
+          : input.purpose === 'password_reset_otp'
+            ? 'password_reset_otp'
+            : 'otp_verify';
+      await tx.execute(
+        'INSERT INTO email_log (id, recipient_email, template_key, status, error_message, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        [
+          `eml-${crypto.randomUUID()}`,
+          input.target,
+          templateKey,
+          sent.ok ? 'sent' : 'queued_preview',
+          sent.ok ? null : 'SMTP not configured',
+          now,
+        ]
+      );
+    } else {
+      deliveryConfigured = smsAdapter.isConfigured();
+      if (deliveryConfigured) {
+        const smsText =
+          input.purpose === 'password_reset_otp'
+            ? `NileLink password reset code: ${code}. Valid for 10 minutes.`
+            : `NileLink verification code: ${code}. Valid for 10 minutes.`;
+        await smsAdapter.sendOtp(input.target, code, smsText);
+      }
+    }
+
+    return { code, deliveryConfigured };
+  }
+
+  async requestAuthVerificationOtp(
+    userId: string,
+    input: { channel: 'email' | 'phone'; target?: string },
+    ipAddress?: string
+  ) {
+    const user = await this.db.queryOne<{
+      id: string;
+      name: string;
+      email: string;
+      phone: string;
+      preferred_locale: string;
+    }>('SELECT id, name, email, phone, preferred_locale FROM users WHERE id = ? AND deleted_at IS NULL', [userId]);
+    if (!user) throw new Error('User not found.');
+
+    const locale = user.preferred_locale === 'ar' ? 'ar' : 'en';
+    let target = input.channel === 'email' ? user.email : user.phone;
+
+    if (input.target && input.target.trim()) {
+      if (input.channel === 'email') {
+        const cleanEmail = input.target.trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+          throw new Error('Invalid email address format.');
+        }
+        if (cleanEmail !== user.email.toLowerCase()) {
+          const dup = await this.db.queryOne<{ id: string }>(
+            'SELECT id FROM users WHERE LOWER(email) = ? AND id != ? AND deleted_at IS NULL',
+            [cleanEmail, userId]
+          );
+          if (dup) throw new Error('This email address is already linked to another account.');
+          await this.db.execute(
+            'UPDATE users SET email = ?, email_verified_at = NULL, updated_at = ? WHERE id = ?',
+            [cleanEmail, toSqlTimestamp(), userId]
+          );
+        }
+        target = cleanEmail;
+      } else {
+        const normPhone = normalizePhoneNumber(input.target);
+        if (!normPhone || normPhone.length < 7) {
+          throw new Error('Invalid phone number format.');
+        }
+        if (normPhone !== user.phone) {
+          const dup = await this.db.queryOne<{ id: string }>(
+            'SELECT id FROM users WHERE phone = ? AND id != ? AND deleted_at IS NULL',
+            [normPhone, userId]
+          );
+          if (dup) throw new Error('This phone number is already linked to another account.');
+          await this.db.execute(
+            'UPDATE users SET phone = ?, phone_verified_at = NULL, updated_at = ? WHERE id = ?',
+            [normPhone, toSqlTimestamp(), userId]
+          );
+        }
+        target = normPhone;
+      }
+    }
+
+    if (!target) {
+      throw new Error(`No ${input.channel} is configured on this account.`);
+    }
+
+    const dispatched = await this.db.transaction(async (tx) => {
+      const res = await this.dispatchOtpChallenge(tx, {
+        userId: user.id,
+        userName: user.name,
+        channel: input.channel,
+        target,
+        purpose: 'verify_contact',
+        locale,
+      });
+      await writeAuditLog(tx, {
+        actorUserId: user.id,
+        action: `auth.verification_otp_sent.${input.channel}`,
+        entityType: 'user',
+        entityId: user.id,
+        after: { target },
+        ipAddress,
+      });
+      return res;
+    });
+
+    const isDevOrTest = process.env.NODE_ENV !== 'production';
+    return {
+      ok: true,
+      channel: input.channel,
+      target,
+      deliveryConfigured: dispatched.deliveryConfigured,
+      expiresInSeconds: 600,
+      ...(isDevOrTest && !dispatched.deliveryConfigured ? { devOtpCode: dispatched.code } : {}),
+    };
+  }
+
+  async confirmAuthVerificationOtp(
+    userId: string,
+    input: { channel: 'email' | 'phone'; code: string },
+    ipAddress?: string
+  ) {
+    const cleanCode = input.code.replace(/\s+/g, '');
+    if (!/^\d{6}$/.test(cleanCode)) {
+      throw new Error('Please enter the 6-digit verification code.');
+    }
+
+    const now = toSqlTimestamp();
+    const txRes = await this.db.transaction(async (tx) => {
+      const challenge = await tx.queryOne<{
+        id: string;
+        target: string;
+        code_hash: string;
+        attempts: number;
+        expires_at: string;
+      }>(
+        `SELECT id, target, code_hash, attempts, expires_at
+         FROM verification_codes
+         WHERE user_id = ? AND channel = ? AND purpose = 'verify_contact' AND consumed_at IS NULL
+         ORDER BY created_at DESC LIMIT 1`,
+        [userId, input.channel]
+      );
+
+      if (!challenge || String(challenge.expires_at) <= now) {
+        throw new Error('Verification code expired or not found. Request a new code.');
+      }
+      if (Number(challenge.attempts) >= 5) {
+        throw new Error('Too many invalid verification attempts. Please request a new code.');
+      }
+
+      const submittedHash = hashOtpCode(userId, input.channel, 'verify_contact', cleanCode);
+      if (!timingSafeStringMatch(challenge.code_hash, submittedHash)) {
+        await tx.execute('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?', [challenge.id]);
+        return { failed: true as const, message: 'Invalid 6-digit verification code.' };
+      }
+
+      await tx.execute('UPDATE verification_codes SET consumed_at = ? WHERE id = ?', [now, challenge.id]);
+
+      if (input.channel === 'email') {
+        await tx.execute('UPDATE users SET email_verified_at = ?, updated_at = ? WHERE id = ?', [now, now, userId]);
+      } else {
+        await tx.execute('UPDATE users SET phone_verified_at = ?, updated_at = ? WHERE id = ?', [now, now, userId]);
+      }
+
+      await writeAuditLog(tx, {
+        actorUserId: userId,
+        action: `auth.verification_confirmed.${input.channel}`,
+        entityType: 'user',
+        entityId: userId,
+        after: { target: challenge.target },
+        ipAddress,
+      });
+
+      const updated = await tx.queryOne<{ email_verified_at: string | null; phone_verified_at: string | null }>(
+        'SELECT email_verified_at, phone_verified_at FROM users WHERE id = ?',
+        [userId]
+      );
+      const emailVerifiedAt = updated?.email_verified_at ? String(updated.email_verified_at) : null;
+      const phoneVerifiedAt = updated?.phone_verified_at ? String(updated.phone_verified_at) : null;
+      return {
+        failed: false as const,
+        data: {
+          ok: true,
+          channel: input.channel,
+          emailVerifiedAt,
+          phoneVerifiedAt,
+          isFullyVerified: Boolean(emailVerifiedAt && phoneVerifiedAt),
+        },
+      };
+    });
+
+    if (txRes.failed) {
+      throw new Error(txRes.message);
+    }
+    return txRes.data;
+  }
+
+  async requestLoginOtp(identifier: string, ipAddress?: string) {
+    const clean = identifier.trim();
+    const channel: 'email' | 'phone' = clean.includes('@') ? 'email' : 'phone';
+    const user = await this.findUserByIdentifier(clean);
+
+    if (!user || user.deleted_at || user.is_blocked) {
+      return { ok: true, channel, deliveryConfigured: true, expiresInSeconds: 600 };
+    }
+
+    const target = channel === 'email' ? user.email : user.phone;
+    const locale = user.preferred_locale === 'ar' ? 'ar' : 'en';
+    const dispatched = await this.db.transaction(async (tx) => {
+      const res = await this.dispatchOtpChallenge(tx, {
+        userId: user.id,
+        userName: user.name,
+        channel,
+        target,
+        purpose: 'login_otp',
+        locale,
+      });
+      await writeAuditLog(tx, {
+        actorUserId: user.id,
+        action: `auth.login_otp_requested.${channel}`,
+        entityType: 'user',
+        entityId: user.id,
+        ipAddress,
+      });
+      return res;
+    });
+
+    const isDevOrTest = process.env.NODE_ENV !== 'production';
+    return {
+      ok: true,
+      channel,
+      deliveryConfigured: dispatched.deliveryConfigured,
+      expiresInSeconds: 600,
+      ...(isDevOrTest && !dispatched.deliveryConfigured ? { devOtpCode: dispatched.code } : {}),
+    };
+  }
+
+  async verifyLoginOtp(input: { identifier: string; code: string; totpCode?: string }, ipAddress?: string) {
+    const clean = input.identifier.trim();
+    const cleanCode = input.code.replace(/\s+/g, '');
+    if (!/^\d{6}$/.test(cleanCode)) {
+      throw new Error('Please enter the 6-digit OTP code.');
+    }
+
+    const user = await this.findUserByIdentifier(clean);
+    if (!user || user.deleted_at) {
+      throw new Error('Invalid credentials or expired OTP code.');
+    }
+    if (user.is_blocked) {
+      throw new Error('Account suspended. Contact NileLink support.');
+    }
+    const nowMs = Date.now();
+    if (user.locked_until && new Date(user.locked_until.replace(' ', 'T') + 'Z').getTime() > nowMs) {
+      throw new Error('Too many failed sign-in attempts. Please wait 15 minutes before retrying.');
+    }
+
+    const channel: 'email' | 'phone' = clean.includes('@') ? 'email' : 'phone';
+    const now = toSqlTimestamp();
+
+    const requiresTotp = user.role_key === 'admin_super' || user.role_key === 'admin_staff' || Boolean(user.totp_enabled);
+    if (requiresTotp) {
+      if (!user.totp_secret || !input.totpCode || !verifyTotpCode(user.totp_secret, input.totpCode)) {
+        throw new Error('Valid 6-digit 2FA authenticator code is required for this account.');
+      }
+    }
+
+    const txRes = await this.db.transaction(async (tx) => {
+      const challenge = await tx.queryOne<{
+        id: string;
+        code_hash: string;
+        attempts: number;
+        expires_at: string;
+      }>(
+        `SELECT id, code_hash, attempts, expires_at
+         FROM verification_codes
+         WHERE user_id = ? AND channel = ? AND purpose = 'login_otp' AND consumed_at IS NULL
+         ORDER BY created_at DESC LIMIT 1`,
+        [user.id, channel]
+      );
+
+      if (!challenge || String(challenge.expires_at) <= now) {
+        throw new Error('Invalid credentials or expired OTP code.');
+      }
+      if (Number(challenge.attempts) >= 5) {
+        throw new Error('Too many failed OTP attempts. Please request a new code.');
+      }
+
+      const submittedHash = hashOtpCode(user.id, channel, 'login_otp', cleanCode);
+      if (!timingSafeStringMatch(challenge.code_hash, submittedHash)) {
+        await tx.execute('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?', [challenge.id]);
+        return { failed: true as const, message: 'Invalid credentials or expired OTP code.' };
+      }
+
+      await tx.execute('UPDATE verification_codes SET consumed_at = ? WHERE id = ?', [now, challenge.id]);
+
+      if (channel === 'email' && !user.email_verified_at) {
+        await tx.execute(
+          'UPDATE users SET email_verified_at = ?, failed_login_attempts = 0, locked_until = NULL, updated_at = ? WHERE id = ?',
+          [now, now, user.id]
+        );
+      } else if (channel === 'phone' && !user.phone_verified_at) {
+        await tx.execute(
+          'UPDATE users SET phone_verified_at = ?, failed_login_attempts = 0, locked_until = NULL, updated_at = ? WHERE id = ?',
+          [now, now, user.id]
+        );
+      } else {
+        await tx.execute(
+          'UPDATE users SET failed_login_attempts = 0, locked_until = NULL, updated_at = ? WHERE id = ?',
+          [now, user.id]
+        );
+      }
+
+      await writeAuditLog(tx, {
+        actorUserId: user.id,
+        action: `auth.login_otp_verified.${channel}`,
+        entityType: 'user',
+        entityId: user.id,
+        ipAddress,
+      });
+
+      return {
+        failed: false as const,
+        user: { id: user.id, name: user.name, email: user.email, roleKey: user.role_key },
+      };
+    });
+
+    if (txRes.failed) {
+      throw new Error(txRes.message);
+    }
+    return txRes.user;
   }
 
   async createAdminStaff(input: {
@@ -544,6 +1003,24 @@ export class MarketplaceRepo {
       [row.id]
     );
 
+    const socialRaw = row.social_links_json
+      ? parseJson<Record<string, unknown>>(row.social_links_json, {})
+      : {};
+    const storedComm = (socialRaw?.communicationPrefs || null) as Partial<SellerCommunicationPrefs> | null;
+    const whatsappPhoneVal = String(row.whatsapp_phone || row.phone || '');
+    const phoneVal = row.phone ? String(row.phone) : String(row.whatsapp_phone || '');
+    const communicationPrefs: SellerCommunicationPrefs = {
+      whatsappEnabled: storedComm?.whatsappEnabled !== undefined ? Boolean(storedComm.whatsappEnabled) : Boolean(whatsappPhoneVal),
+      whatsappGreeting:
+        typeof storedComm?.whatsappGreeting === 'string' ? storedComm.whatsappGreeting : '',
+      systemChatEnabled: storedComm?.systemChatEnabled !== undefined ? Boolean(storedComm.systemChatEnabled) : true,
+      phoneCallsEnabled: storedComm?.phoneCallsEnabled !== undefined ? Boolean(storedComm.phoneCallsEnabled) : Boolean(phoneVal),
+      preferredChannel:
+        storedComm?.preferredChannel === 'system_chat' || storedComm?.preferredChannel === 'phone'
+          ? storedComm.preferredChannel
+          : 'whatsapp',
+    };
+
     return {
       id: String(row.id),
       slug: String(row.slug),
@@ -560,7 +1037,9 @@ export class MarketplaceRepo {
       governorate: String(row.governorate),
       district: String(row.district),
       cityAddress: String(row.city_address || ''),
-      whatsappPhone: String(row.whatsapp_phone || row.phone || ''),
+      phone: phoneVal,
+      whatsappPhone: whatsappPhoneVal,
+      communicationPrefs,
       payoutMethod: String(row.payout_method || 'whish') as Seller['payoutMethod'],
       payoutAccount: String(row.payout_account || ''),
       commercialRegRef: String(row.commercial_reg_ref || ''),
@@ -577,6 +1056,7 @@ export class MarketplaceRepo {
       returnPolicy: row.return_policy_json ? parseJson<LocalizedText | null>(row.return_policy_json, null) : null,
       processingHours: row.processing_hours !== null && row.processing_hours !== undefined ? Number(row.processing_hours) : 24,
       vacationMode: Boolean(row.vacation_mode),
+      workingHours: row.working_hours_json ? parseJson<Record<string, string> | null>(row.working_hours_json, null) : null,
       seoTitle: row.seo_title ? String(row.seo_title) : null,
       seoDescription: row.seo_description ? String(row.seo_description) : null,
       locations: row.locations_json ? parseJson<StoreLocation[]>(row.locations_json, []) : [],
@@ -645,7 +1125,7 @@ export class MarketplaceRepo {
     const rows = await this.db.query<Record<string, unknown>>(
       `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
               st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.locations_json, st.rating_avg_x10, st.review_count,
-              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.working_hours_json, ss.return_policy_json, ss.social_links_json, ss.seo_title, ss.seo_description
        FROM sellers sel
        INNER JOIN stores st ON st.seller_id = sel.id
        LEFT JOIN store_settings ss ON ss.store_id = st.id
@@ -661,7 +1141,7 @@ export class MarketplaceRepo {
     const row = await this.db.queryOne<Record<string, unknown>>(
       `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
               st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.locations_json, st.rating_avg_x10, st.review_count,
-              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.working_hours_json, ss.return_policy_json, ss.social_links_json, ss.seo_title, ss.seo_description
        FROM sellers sel
        INNER JOIN stores st ON st.seller_id = sel.id
        LEFT JOIN store_settings ss ON ss.store_id = st.id
@@ -675,7 +1155,7 @@ export class MarketplaceRepo {
     const row = await this.db.queryOne<Record<string, unknown>>(
       `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
               st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.locations_json, st.rating_avg_x10, st.review_count,
-              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.working_hours_json, ss.return_policy_json, ss.social_links_json, ss.seo_title, ss.seo_description
        FROM sellers sel
        INNER JOIN stores st ON st.seller_id = sel.id
        LEFT JOIN store_settings ss ON ss.store_id = st.id
@@ -1579,7 +2059,8 @@ export class MarketplaceRepo {
           {
             en: `Your order totaling $${(grandTotalUsdCents / 100).toFixed(2)} is confirmed.`,
             ar: `تم تأكيد طلبك بقيمة ${(grandTotalUsdCents / 100).toFixed(2)} دولار.`,
-          }
+          },
+          { category: 'order', actionUrl: '/orders', metadata: { orderId, orderNumber } }
         );
       }
       for (const [, bucket] of matchingSubOrderEntries) {
@@ -1590,7 +2071,8 @@ export class MarketplaceRepo {
           {
             en: `${bucket.items.length} item(s) ordered from ${bucket.seller.name.en}.`,
             ar: `تم طلب ${bucket.items.length} منتج من متجرك ${bucket.seller.name.ar}.`,
-          }
+          },
+          { category: 'order', actionUrl: '/seller', metadata: { orderId, orderNumber } }
         );
       }
 
@@ -1907,7 +2389,7 @@ export class MarketplaceRepo {
         (await tx.queryOne<Record<string, unknown>>(
           `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
                   st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.locations_json, st.rating_avg_x10, st.review_count,
-                  ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+                  ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.working_hours_json, ss.return_policy_json, ss.social_links_json, ss.seo_title, ss.seo_description
            FROM sellers sel INNER JOIN stores st ON st.seller_id = sel.id LEFT JOIN store_settings ss ON ss.store_id = st.id
            WHERE sel.id = ?`,
           [sellerId]
@@ -2227,6 +2709,8 @@ export class MarketplaceRepo {
     sellerId: string,
     actorUserId: string,
     patch: {
+      nameEn?: string;
+      nameAr?: string;
       taglineEn?: string;
       taglineAr?: string;
       aboutEn?: string;
@@ -2237,6 +2721,7 @@ export class MarketplaceRepo {
       returnPolicyAr?: string;
       processingHours?: number;
       vacationMode?: boolean;
+      workingHours?: Record<string, string>;
       seoTitle?: string;
       seoDescription?: string;
       storefrontTheme?: StorefrontThemeId;
@@ -2244,7 +2729,10 @@ export class MarketplaceRepo {
       selfDeliveryFeesUsdCents?: Record<string, number>;
       payoutMethod?: 'whish' | 'omt' | 'bank';
       payoutAccount?: string;
+      phone?: string;
       whatsappPhone?: string;
+      communicationPrefs?: SellerCommunicationPrefs;
+      cityAddress?: string;
       bannerMediaId?: string;
       logoMediaId?: string;
       locations?: StoreLocation[];
@@ -2254,16 +2742,31 @@ export class MarketplaceRepo {
     return this.db.transaction(async (tx) => {
       const storeRow = await tx.queryOne<{
         id: string;
+        name_json: string;
         tagline_json: string;
         about_json: string;
         announcement_json: string | null;
         locations_json: string | null;
-      }>('SELECT id, tagline_json, about_json, announcement_json, locations_json FROM stores WHERE seller_id = ?', [sellerId]);
+      }>('SELECT id, name_json, tagline_json, about_json, announcement_json, locations_json FROM stores WHERE seller_id = ?', [sellerId]);
       if (!storeRow) throw new Error('Store not found.');
 
+      if (patch.bannerMediaId) {
+        const bm = await tx.queryOne<{ id: string }>('SELECT id FROM media WHERE id = ?', [patch.bannerMediaId]);
+        if (!bm) throw new Error('Banner image media asset not found.');
+      }
+      if (patch.logoMediaId) {
+        const lm = await tx.queryOne<{ id: string }>('SELECT id FROM media WHERE id = ?', [patch.logoMediaId]);
+        if (!lm) throw new Error('Store logo media asset not found.');
+      }
+
+      const currName = parseJson<LocalizedText>(storeRow.name_json, { en: '', ar: '' });
       const currTagline = parseJson<LocalizedText>(storeRow.tagline_json, { en: '', ar: '' });
       const currAbout = parseJson<LocalizedText>(storeRow.about_json, { en: '', ar: '' });
       const currAnn = storeRow.announcement_json ? parseJson<LocalizedText>(storeRow.announcement_json, { en: '', ar: '' }) : { en: '', ar: '' };
+      const nextName = {
+        en: patch.nameEn !== undefined && patch.nameEn.trim() ? patch.nameEn.trim() : currName.en,
+        ar: patch.nameAr !== undefined && patch.nameAr.trim() ? patch.nameAr.trim() : currName.ar,
+      };
       const nextTagline = {
         en: patch.taglineEn !== undefined ? patch.taglineEn : currTagline.en,
         ar: patch.taglineAr !== undefined ? patch.taglineAr : currTagline.ar,
@@ -2315,7 +2818,7 @@ export class MarketplaceRepo {
       }
 
       await tx.execute(
-        `UPDATE stores SET tagline_json = ?, about_json = ?,
+        `UPDATE stores SET name_json = ?, tagline_json = ?, about_json = ?,
          announcement_json = COALESCE(?, announcement_json),
          theme_id = COALESCE(?, theme_id),
          banner_media_id = COALESCE(?, banner_media_id),
@@ -2324,6 +2827,7 @@ export class MarketplaceRepo {
          updated_at = ?
          WHERE id = ?`,
         [
+          JSON.stringify(nextName),
           JSON.stringify(nextTagline),
           JSON.stringify(nextAbout),
           nextAnn ? JSON.stringify(nextAnn) : null,
@@ -2342,7 +2846,9 @@ export class MarketplaceRepo {
         self_delivery_fees_json: string;
         processing_hours: number;
         vacation_mode: number | boolean;
+        working_hours_json: string | null;
         return_policy_json: string | null;
+        social_links_json: string | null;
         seo_title: string | null;
         seo_description: string | null;
       }>('SELECT * FROM store_settings WHERE store_id = ?', [storeRow.id]);
@@ -2363,27 +2869,59 @@ export class MarketplaceRepo {
           ? patch.selfDeliveryFeesUsdCents
           : parseJson<Record<string, number>>(settingsRow?.self_delivery_fees_json, {});
 
+      const currWorkingHours = settingsRow?.working_hours_json
+        ? parseJson<Record<string, string> | null>(settingsRow.working_hours_json, null)
+        : null;
+      const nextWorkingHours = patch.workingHours !== undefined ? patch.workingHours : currWorkingHours;
+
+      const currSocial = settingsRow?.social_links_json
+        ? parseJson<Record<string, unknown>>(settingsRow.social_links_json, {})
+        : {};
+      const nextSocial =
+        patch.communicationPrefs !== undefined
+          ? {
+              ...currSocial,
+              communicationPrefs: {
+                whatsappEnabled: Boolean(patch.communicationPrefs.whatsappEnabled),
+                whatsappGreeting: (patch.communicationPrefs.whatsappGreeting || '').trim().slice(0, 300),
+                systemChatEnabled: Boolean(patch.communicationPrefs.systemChatEnabled),
+                phoneCallsEnabled: Boolean(patch.communicationPrefs.phoneCallsEnabled),
+                preferredChannel: patch.communicationPrefs.preferredChannel || 'whatsapp',
+              },
+            }
+          : currSocial;
+
       await tx.execute(
         `UPDATE store_settings
-         SET delivery_mode = ?, self_delivery_fees_json = ?, processing_hours = ?, vacation_mode = ?, return_policy_json = ?, seo_title = ?, seo_description = ?
+         SET delivery_mode = ?, self_delivery_fees_json = ?, processing_hours = ?, vacation_mode = ?, working_hours_json = ?, return_policy_json = ?, social_links_json = ?, seo_title = ?, seo_description = ?
          WHERE store_id = ?`,
         [
           patch.deliveryMode || settingsRow?.delivery_mode || 'platform',
           JSON.stringify(nextFees),
           patch.processingHours !== undefined ? Math.max(1, Math.min(360, Math.trunc(patch.processingHours))) : Number(settingsRow?.processing_hours ?? 24),
           patch.vacationMode !== undefined ? (patch.vacationMode ? 1 : 0) : settingsRow?.vacation_mode ? 1 : 0,
+          nextWorkingHours ? JSON.stringify(nextWorkingHours) : null,
           JSON.stringify(nextRet),
+          JSON.stringify(nextSocial),
           patch.seoTitle !== undefined ? patch.seoTitle.trim() || null : settingsRow?.seo_title ?? null,
           patch.seoDescription !== undefined ? patch.seoDescription.trim() || null : settingsRow?.seo_description ?? null,
           storeRow.id,
         ]
       );
 
-      if (patch.payoutMethod || patch.payoutAccount !== undefined || patch.whatsappPhone !== undefined || primaryLocation) {
+      if (
+        patch.payoutMethod ||
+        patch.payoutAccount !== undefined ||
+        patch.phone !== undefined ||
+        patch.whatsappPhone !== undefined ||
+        patch.cityAddress !== undefined ||
+        primaryLocation
+      ) {
         await tx.execute(
           `UPDATE sellers
            SET payout_method = COALESCE(?, payout_method),
                payout_account = COALESCE(?, payout_account),
+               phone = COALESCE(?, phone),
                whatsapp_phone = COALESCE(?, whatsapp_phone),
                governorate = COALESCE(?, governorate),
                district = COALESCE(?, district),
@@ -2393,10 +2931,11 @@ export class MarketplaceRepo {
           [
             patch.payoutMethod || null,
             patch.payoutAccount !== undefined ? patch.payoutAccount.trim() : null,
+            patch.phone !== undefined ? normalizePhoneNumber(patch.phone) || patch.phone.trim() : null,
             patch.whatsappPhone !== undefined ? patch.whatsappPhone.trim() : null,
             primaryLocation?.governorate || null,
             primaryLocation?.district || null,
-            primaryLocation?.address || null,
+            patch.cityAddress !== undefined ? patch.cityAddress.trim() : primaryLocation?.address || null,
             toSqlTimestamp(),
             sellerId,
           ]
@@ -2415,7 +2954,7 @@ export class MarketplaceRepo {
       const updatedSellerRow = await tx.queryOne<Record<string, unknown>>(
         `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
                 st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.locations_json, st.rating_avg_x10, st.review_count,
-                ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+                ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.working_hours_json, ss.return_policy_json, ss.social_links_json, ss.seo_title, ss.seo_description
          FROM sellers sel INNER JOIN stores st ON st.seller_id = sel.id LEFT JOIN store_settings ss ON ss.store_id = st.id
          WHERE sel.id = ? LIMIT 1`,
         [sellerId]
@@ -2648,6 +3187,16 @@ export class MarketplaceRepo {
             {
               en: `Shipment status changed to ${nextStatus}${patch.trackingCode ? ` (Tracking: ${patch.trackingCode})` : ''}.`,
               ar: `تم تحديث حالة الشحنة إلى ${nextStatus}${patch.trackingCode ? ` (رمز التتبع: ${patch.trackingCode})` : ''}.`,
+            },
+            {
+              category: 'order',
+              actionUrl: '/orders',
+              metadata: {
+                subOrderId,
+                orderNumber: orderRow.order_number,
+                status: nextStatus,
+                trackingCode: patch.trackingCode || null,
+              },
             }
           );
         }
@@ -2961,7 +3510,7 @@ export class MarketplaceRepo {
     const sellerRows = await this.db.query<Record<string, unknown>>(
       `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
               st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.locations_json, st.rating_avg_x10, st.review_count,
-              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.working_hours_json, ss.return_policy_json, ss.social_links_json, ss.seo_title, ss.seo_description
        FROM sellers sel
        INNER JOIN stores st ON st.seller_id = sel.id
        LEFT JOIN store_settings ss ON ss.store_id = st.id
@@ -3177,15 +3726,26 @@ export class MarketplaceRepo {
       role_key: string;
       is_blocked: number | boolean;
       totp_enabled: number | boolean;
+      email_verified_at: string | null;
+      phone_verified_at: string | null;
       created_at: string;
     }>(
-      'SELECT id, name, email, phone, role_key, is_blocked, totp_enabled, created_at FROM users WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 120'
+      'SELECT id, name, email, phone, role_key, is_blocked, totp_enabled, email_verified_at, phone_verified_at, created_at FROM users WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 120'
     );
     const users = [];
     for (const u of userSummaryRows) {
-      const perms = await this.db.query<{ permission_key: string }>('SELECT permission_key FROM user_permissions WHERE user_id = ?', [
-        u.id,
+      const [perms, ordCntRow, sessCntRow, lastAuditRow] = await Promise.all([
+        this.db.query<{ permission_key: string }>('SELECT permission_key FROM user_permissions WHERE user_id = ?', [u.id]),
+        this.db.queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM orders WHERE user_id = ?', [u.id]),
+        this.db.queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM sessions WHERE user_id = ?', [u.id]),
+        this.db.queryOne<{ created_at: string }>(
+          "SELECT created_at FROM audit_log WHERE actor_user_id = ? OR (entity_type = 'user' AND entity_id = ?) ORDER BY created_at DESC LIMIT 1",
+          [u.id, u.id]
+        ),
       ]);
+      const ownedSeller = sellers.find((s) => s.userId === u.id) || null;
+      const emailVerifiedAt = u.email_verified_at ? String(u.email_verified_at) : null;
+      const phoneVerifiedAt = u.phone_verified_at ? String(u.phone_verified_at) : null;
       users.push({
         id: u.id,
         name: u.name,
@@ -3194,7 +3754,15 @@ export class MarketplaceRepo {
         roleKey: u.role_key,
         isBlocked: Boolean(u.is_blocked),
         totpEnabled: Boolean(u.totp_enabled),
+        emailVerifiedAt,
+        phoneVerifiedAt,
+        isFullyVerified: Boolean(emailVerifiedAt && phoneVerifiedAt),
         permissions: perms.map((p) => p.permission_key),
+        ordersCount: Number(ordCntRow?.cnt ?? 0),
+        activeSessionsCount: Number(sessCntRow?.cnt ?? 0),
+        sellerId: ownedSeller?.id ?? null,
+        sellerName: ownedSeller ? ownedSeller.name.en : null,
+        lastActivityAt: lastAuditRow?.created_at ? String(lastAuditRow.created_at) : String(u.created_at),
         createdAt: String(u.created_at),
       });
     }
@@ -3386,7 +3954,7 @@ export class MarketplaceRepo {
       const updatedRow = await tx.queryOne<Record<string, unknown>>(
         `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
                 st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.locations_json, st.rating_avg_x10, st.review_count,
-                ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+                ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.working_hours_json, ss.return_policy_json, ss.social_links_json, ss.seo_title, ss.seo_description
          FROM sellers sel INNER JOIN stores st ON st.seller_id = sel.id LEFT JOIN store_settings ss ON ss.store_id = st.id
          WHERE sel.id = ? LIMIT 1`,
         [sellerId]
@@ -5735,7 +6303,11 @@ export class MarketplaceRepo {
       ipAddress,
     });
     const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM offers WHERE id = ?', [id]);
-    return this.mapOfferRow(row!);
+    const mappedOffer = this.mapOfferRow(row!);
+    if (mappedOffer.active && mappedOffer.approvalStatus === 'approved') {
+      await this.dispatchOfferActivatedNotifications(this.db, mappedOffer);
+    }
+    return mappedOffer;
   }
 
   async adminUpdateOffer(
@@ -5802,7 +6374,15 @@ export class MarketplaceRepo {
       `SELECT o.*, st.name_json AS seller_name_json FROM offers o LEFT JOIN stores st ON st.seller_id = o.seller_id WHERE o.id = ?`,
       [id]
     );
-    return this.mapOfferRow(row!);
+    const mappedOffer = this.mapOfferRow(row!);
+    const becameActive =
+      (String(existing.approval_status) !== 'approved' || !Boolean(existing.active)) &&
+      mappedOffer.approvalStatus === 'approved' &&
+      mappedOffer.active;
+    if (becameActive) {
+      await this.dispatchOfferActivatedNotifications(this.db, mappedOffer);
+    }
+    return mappedOffer;
   }
 
   async adminDeleteOffer(id: string, actorUserId: string, ipAddress?: string): Promise<void> {
@@ -5943,6 +6523,9 @@ export class MarketplaceRepo {
         await tx.query<Record<string, unknown>>('SELECT * FROM flash_sales WHERE id = ?', [id]),
         tx
       );
+      if (created.status === 'active') {
+        await this.dispatchFlashSaleNotifications(tx, created);
+      }
       return created;
     });
   }
@@ -5979,6 +6562,9 @@ export class MarketplaceRepo {
     const [row] = await this.hydrateFlashSales(
       await this.db.query<Record<string, unknown>>('SELECT * FROM flash_sales WHERE id = ?', [id])
     );
+    if (String(existing.status) !== 'active' && row.status === 'active') {
+      await this.dispatchFlashSaleNotifications(this.db, row);
+    }
     return row;
   }
 
@@ -6097,7 +6683,20 @@ export class MarketplaceRepo {
       ipAddress,
     });
     const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM campaigns WHERE id = ?', [id]);
-    return this.mapCampaignRow(row!);
+    const created = this.mapCampaignRow(row!);
+    if (created.status === 'active') {
+      await this.notifyPromotionalOfferFanout(this.db, {
+        entityType: 'campaign',
+        entityId: created.id,
+        title: created.title,
+        body: {
+          en: `${created.subtitle.en || created.description.en || 'New curated campaign live on NileLink.'}`,
+          ar: `${created.subtitle.ar || created.description.ar || 'حملة عروض جديدة متاحة الآن على نايل لينك.'}`,
+        },
+        actionUrl: `/campaign/${created.slug}`,
+      });
+    }
+    return created;
   }
 
   async adminUpdateCampaign(
@@ -6148,7 +6747,20 @@ export class MarketplaceRepo {
       ipAddress,
     });
     const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM campaigns WHERE id = ?', [id]);
-    return this.mapCampaignRow(row!);
+    const updated = this.mapCampaignRow(row!);
+    if (existing.status !== 'active' && updated.status === 'active') {
+      await this.notifyPromotionalOfferFanout(this.db, {
+        entityType: 'campaign',
+        entityId: updated.id,
+        title: updated.title,
+        body: {
+          en: `${updated.subtitle.en || updated.description.en || 'New promotional campaign is now live.'}`,
+          ar: `${updated.subtitle.ar || updated.description.ar || 'انطلقت حملة عروض ترويجية جديدة الآن.'}`,
+        },
+        actionUrl: `/campaign/${updated.slug}`,
+      });
+    }
+    return updated;
   }
 
   async adminDeleteCampaign(id: string, actorUserId: string, ipAddress?: string): Promise<void> {
@@ -6250,7 +6862,11 @@ export class MarketplaceRepo {
       ipAddress,
     });
     const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM offers WHERE id = ?', [id]);
-    return this.mapOfferRow(row!);
+    const offer = this.mapOfferRow(row!);
+    if (offer.approvalStatus === 'approved' && offer.active) {
+      await this.dispatchOfferActivatedNotifications(this.db, offer);
+    }
+    return offer;
   }
 
   // --- Step 5: Customer Segments, Email Block Campaigns & Automated Flows ---
@@ -7113,28 +7729,333 @@ export class MarketplaceRepo {
     }));
   }
 
-  async createNotification(txOrDb: DbTx, userId: string, title: LocalizedText, body: LocalizedText): Promise<void> {
-    await txOrDb.execute(
-      'INSERT INTO notifications (id, user_id, title_json, body_json, read_at, created_at) VALUES (?, ?, ?, ?, NULL, ?)',
-      [`ntf-${crypto.randomUUID()}`, userId, JSON.stringify(title), JSON.stringify(body), toSqlTimestamp()]
+  async getNotificationPreferences(userId: string, txOrDb: DbTx = this.db): Promise<NotificationPreferences> {
+    const row = await txOrDb.queryOne<{
+      email_summary_enabled: number | boolean;
+      summary_frequency: string;
+      order_updates: number | boolean;
+      price_drops: number | boolean;
+      promotional_offers: number | boolean;
+      last_summary_sent_at: string | null;
+    }>('SELECT * FROM notification_preferences WHERE user_id = ?', [userId]);
+
+    return {
+      emailSummaryEnabled: row ? Boolean(row.email_summary_enabled) : true,
+      summaryFrequency: (row?.summary_frequency || 'daily') as NotificationPreferences['summaryFrequency'],
+      orderUpdates: row ? Boolean(row.order_updates) : true,
+      priceDrops: row ? Boolean(row.price_drops) : true,
+      promotionalOffers: row ? Boolean(row.promotional_offers) : true,
+      lastSummarySentAt: row?.last_summary_sent_at ? String(row.last_summary_sent_at) : null,
+    };
+  }
+
+  async updateNotificationPreferences(
+    userId: string,
+    patch: Partial<NotificationPreferences>
+  ): Promise<NotificationPreferences> {
+    const current = await this.getNotificationPreferences(userId);
+    const next: NotificationPreferences = {
+      emailSummaryEnabled: patch.emailSummaryEnabled ?? current.emailSummaryEnabled,
+      summaryFrequency: patch.summaryFrequency ?? current.summaryFrequency,
+      orderUpdates: patch.orderUpdates ?? current.orderUpdates,
+      priceDrops: patch.priceDrops ?? current.priceDrops,
+      promotionalOffers: patch.promotionalOffers ?? current.promotionalOffers,
+      lastSummarySentAt: current.lastSummarySentAt ?? null,
+    };
+    const now = toSqlTimestamp();
+    const existing = await this.db.queryOne<{ user_id: string }>(
+      'SELECT user_id FROM notification_preferences WHERE user_id = ?',
+      [userId]
     );
+    if (existing) {
+      await this.db.execute(
+        `UPDATE notification_preferences
+         SET email_summary_enabled = ?, summary_frequency = ?, order_updates = ?, price_drops = ?, promotional_offers = ?, updated_at = ?
+         WHERE user_id = ?`,
+        [
+          next.emailSummaryEnabled ? 1 : 0,
+          next.summaryFrequency,
+          next.orderUpdates ? 1 : 0,
+          next.priceDrops ? 1 : 0,
+          next.promotionalOffers ? 1 : 0,
+          now,
+          userId,
+        ]
+      );
+    } else {
+      await this.db.execute(
+        `INSERT INTO notification_preferences (user_id, email_summary_enabled, summary_frequency, order_updates, price_drops, promotional_offers, last_summary_sent_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
+        [
+          userId,
+          next.emailSummaryEnabled ? 1 : 0,
+          next.summaryFrequency,
+          next.orderUpdates ? 1 : 0,
+          next.priceDrops ? 1 : 0,
+          next.promotionalOffers ? 1 : 0,
+          now,
+        ]
+      );
+    }
+    return this.getNotificationPreferences(userId);
+  }
+
+  async createNotification(
+    txOrDb: DbTx,
+    userId: string,
+    title: LocalizedText,
+    body: LocalizedText,
+    opts?: {
+      category?: NotificationCategory;
+      actionUrl?: string | null;
+      metadata?: Record<string, unknown> | null;
+      respectPreference?: boolean;
+    }
+  ): Promise<string | null> {
+    const category: NotificationCategory = opts?.category || 'system';
+    const prefs = await this.getNotificationPreferences(userId, txOrDb);
+
+    if (opts?.respectPreference !== false) {
+      if (category === 'order' && !prefs.orderUpdates) return null;
+      if (category === 'price_drop' && !prefs.priceDrops) return null;
+      if (category === 'promo' && !prefs.promotionalOffers) return null;
+    }
+
+    const id = `ntf-${crypto.randomUUID()}`;
+    const now = toSqlTimestamp();
+    await txOrDb.execute(
+      'INSERT INTO notifications (id, user_id, category, title_json, body_json, action_url, metadata_json, emailed_at, read_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)',
+      [
+        id,
+        userId,
+        category,
+        JSON.stringify(title),
+        JSON.stringify(body),
+        opts?.actionUrl || null,
+        opts?.metadata ? JSON.stringify(opts.metadata) : null,
+        now,
+      ]
+    );
+
+    if (prefs.emailSummaryEnabled && prefs.summaryFrequency === 'instant') {
+      await txOrDb.execute(
+        'INSERT INTO jobs (id, job_type, payload_json, status, attempts, run_at, created_at) VALUES (?, ?, ?, ?, 0, ?, ?)',
+        [
+          `job-${crypto.randomUUID()}`,
+          'send_notification_summary',
+          JSON.stringify({ userId, notificationId: id }),
+          'queued',
+          now,
+          now,
+        ]
+      );
+    }
+    return id;
+  }
+
+  async notifyWishlistPriceDrop(
+    txOrDb: DbTx,
+    input: {
+      productId: string;
+      oldPriceUsdCents: number;
+      newPriceUsdCents: number;
+      offerTitle?: LocalizedText;
+    }
+  ): Promise<number> {
+    if (input.newPriceUsdCents >= input.oldPriceUsdCents || input.newPriceUsdCents <= 0) return 0;
+    const prod = await txOrDb.queryOne<{ id: string; slug: string; title_json: string }>(
+      'SELECT id, slug, title_json FROM products WHERE id = ? AND deleted_at IS NULL',
+      [input.productId]
+    );
+    if (!prod) return 0;
+
+    const prodTitle = parseJson<LocalizedText>(prod.title_json, { en: 'Product', ar: 'منتج' });
+    const oldUsd = (input.oldPriceUsdCents / 100).toFixed(2);
+    const newUsd = (input.newPriceUsdCents / 100).toFixed(2);
+    const pctOff = Math.max(1, Math.round(((input.oldPriceUsdCents - input.newPriceUsdCents) / input.oldPriceUsdCents) * 100));
+
+    const wishers = await txOrDb.query<{ user_id: string }>(
+      `SELECT DISTINCT w.user_id
+       FROM wishlists w
+       INNER JOIN users u ON u.id = w.user_id
+       WHERE w.product_id = ? AND u.deleted_at IS NULL AND u.is_blocked = 0`,
+      [input.productId]
+    );
+
+    let sent = 0;
+    for (const w of wishers) {
+      const createdId = await this.createNotification(
+        txOrDb,
+        w.user_id,
+        {
+          en: `Price drop: ${prodTitle.en} (-${pctOff}%)`,
+          ar: `انخفاض السعر: ${prodTitle.ar} (-${pctOff}%)`,
+        },
+        {
+          en: `${prodTitle.en} dropped from $${oldUsd} to $${newUsd}${input.offerTitle?.en ? ` (${input.offerTitle.en})` : ''}.`,
+          ar: `انخفض سعر ${prodTitle.ar} من $${oldUsd} إلى $${newUsd}${input.offerTitle?.ar ? ` (${input.offerTitle.ar})` : ''}.`,
+        },
+        {
+          category: 'price_drop',
+          actionUrl: `/product/${prod.slug}`,
+          metadata: {
+            productId: prod.id,
+            oldPriceUsdCents: input.oldPriceUsdCents,
+            newPriceUsdCents: input.newPriceUsdCents,
+            percentOff: pctOff,
+          },
+        }
+      );
+      if (createdId) sent++;
+    }
+    return sent;
+  }
+
+  async notifyPromotionalOfferFanout(
+    txOrDb: DbTx,
+    input: {
+      entityType: string;
+      entityId: string;
+      title: LocalizedText;
+      body: LocalizedText;
+      actionUrl: string;
+    }
+  ): Promise<number> {
+    const users = await txOrDb.query<{ id: string }>(
+      `SELECT id FROM users
+       WHERE deleted_at IS NULL AND is_blocked = 0 AND role_key IN ('customer', 'seller_owner')
+       LIMIT 300`
+    );
+    let sent = 0;
+    for (const u of users) {
+      const createdId = await this.createNotification(txOrDb, u.id, input.title, input.body, {
+        category: 'promo',
+        actionUrl: input.actionUrl,
+        metadata: { entityType: input.entityType, entityId: input.entityId },
+      });
+      if (createdId) sent++;
+    }
+    return sent;
+  }
+
+  private async dispatchOfferActivatedNotifications(txOrDb: DbTx, offer: Offer): Promise<void> {
+    if (!['percent', 'fixed_usd_cents', 'flash_percent'].includes(offer.offerType)) {
+      if (offer.targetType === 'all' || offer.targetType === 'category') {
+        await this.notifyPromotionalOfferFanout(txOrDb, {
+          entityType: 'offer',
+          entityId: offer.id,
+          title: { en: `New offer: ${offer.title.en}`, ar: `عرض جديد: ${offer.title.ar}` },
+          body: {
+            en: 'New savings are now live on NileLink Marketplace.',
+            ar: 'تم تفعيل عرض توفير جديد الآن على سوق نايل لينك.',
+          },
+          actionUrl: offer.targetType === 'category' && offer.targetId ? `/catalog?category=${encodeURIComponent(offer.targetId)}` : '/catalog?deals=true',
+        });
+      }
+      return;
+    }
+
+    const calcNewPrice = (baseCents: number): number => {
+      if (offer.offerType === 'fixed_usd_cents') {
+        return Math.max(1, baseCents - offer.discountValue);
+      }
+      return Math.max(1, Math.round((baseCents * (100 - offer.discountValue)) / 100));
+    };
+
+    if (offer.targetType === 'product' && offer.targetId) {
+      const prod = await txOrDb.queryOne<{ id: string; base_price_usd_cents: number }>(
+        'SELECT id, base_price_usd_cents FROM products WHERE id = ? AND deleted_at IS NULL AND published = 1',
+        [offer.targetId]
+      );
+      if (prod) {
+        await this.notifyWishlistPriceDrop(txOrDb, {
+          productId: prod.id,
+          oldPriceUsdCents: Number(prod.base_price_usd_cents),
+          newPriceUsdCents: calcNewPrice(Number(prod.base_price_usd_cents)),
+          offerTitle: offer.title,
+        });
+      }
+    } else if (offer.targetType === 'seller' && offer.targetId) {
+      const wishedProds = await txOrDb.query<{ id: string; base_price_usd_cents: number }>(
+        `SELECT DISTINCT p.id, p.base_price_usd_cents
+         FROM products p
+         INNER JOIN wishlists w ON w.product_id = p.id
+         WHERE p.seller_id = ? AND p.deleted_at IS NULL AND p.published = 1
+         LIMIT 100`,
+        [offer.targetId]
+      );
+      for (const wp of wishedProds) {
+        await this.notifyWishlistPriceDrop(txOrDb, {
+          productId: wp.id,
+          oldPriceUsdCents: Number(wp.base_price_usd_cents),
+          newPriceUsdCents: calcNewPrice(Number(wp.base_price_usd_cents)),
+          offerTitle: offer.title,
+        });
+      }
+    } else {
+      const labelOff =
+        offer.offerType === 'fixed_usd_cents'
+          ? `$${(offer.discountValue / 100).toFixed(2)} OFF`
+          : `${offer.discountValue}% OFF`;
+      await this.notifyPromotionalOfferFanout(txOrDb, {
+        entityType: 'offer',
+        entityId: offer.id,
+        title: { en: `${offer.title.en} · ${labelOff}`, ar: `${offer.title.ar} · خصم ${labelOff}` },
+        body: {
+          en: `Limited-time promotional offer is now active across eligible NileLink items.`,
+          ar: `عرض ترويجي لفترة محدودة متاح الآن على المنتجات المؤهلة في نايل لينك.`,
+        },
+        actionUrl: offer.targetType === 'category' && offer.targetId ? `/catalog?category=${encodeURIComponent(offer.targetId)}` : '/catalog?deals=true',
+      });
+    }
+  }
+
+  private async dispatchFlashSaleNotifications(txOrDb: DbTx, flashSale: FlashSale): Promise<void> {
+    for (const item of flashSale.items) {
+      if (item.basePriceUsdCents && item.salePriceUsdCents < item.basePriceUsdCents) {
+        await this.notifyWishlistPriceDrop(txOrDb, {
+          productId: item.productId,
+          oldPriceUsdCents: item.basePriceUsdCents,
+          newPriceUsdCents: item.salePriceUsdCents,
+          offerTitle: flashSale.title,
+        });
+      }
+    }
+    await this.notifyPromotionalOfferFanout(txOrDb, {
+      entityType: 'flash_sale',
+      entityId: flashSale.id,
+      title: { en: `Flash Sale Live: ${flashSale.title.en}`, ar: `عرض خاطف مباشر: ${flashSale.title.ar}` },
+      body: {
+        en: `${flashSale.items.length} curated item(s) discounted with limited stock caps.`,
+        ar: `${flashSale.items.length} منتجات مختارة بخصومات حصرية وكميات محدودة.`,
+      },
+      actionUrl: '/catalog?deals=true',
+    });
   }
 
   async getUserNotifications(userId: string): Promise<NotificationItem[]> {
     const rows = await this.db.query<{
       id: string;
       user_id: string;
+      category: string | null;
       title_json: string;
       body_json: string;
+      action_url: string | null;
+      metadata_json: string | null;
+      emailed_at: string | null;
       read_at: string | null;
       created_at: string;
-    }>('SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 60', [userId]);
+    }>('SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 80', [userId]);
 
     return rows.map((r) => ({
       id: r.id,
       userId: r.user_id,
+      category: (r.category || 'system') as NotificationCategory,
       title: parseJson<LocalizedText>(r.title_json, { en: '', ar: '' }),
       body: parseJson<LocalizedText>(r.body_json, { en: '', ar: '' }),
+      actionUrl: r.action_url ? String(r.action_url) : null,
+      metadata: r.metadata_json ? parseJson<Record<string, unknown> | null>(r.metadata_json, null) : null,
+      emailedAt: r.emailed_at ? String(r.emailed_at) : null,
       readAt: r.read_at ? String(r.read_at) : null,
       createdAt: String(r.created_at),
     }));
@@ -7154,6 +8075,158 @@ export class MarketplaceRepo {
       [now, idOrAll, userId]
     );
     return { updated: res.affectedRows };
+  }
+
+  async requestPasswordResetOtp(
+    input: { identifier?: string; email?: string; channel?: 'email' | 'sms' },
+    ipAddress?: string
+  ): Promise<{
+    ok: boolean;
+    channel: 'email' | 'sms';
+    deliveryConfigured: boolean;
+    expiresInSeconds: number;
+    devOtpCode?: string;
+  }> {
+    const rawIdentifier = (input.identifier || input.email || '').trim();
+    if (!rawIdentifier || rawIdentifier.length < 3) {
+      throw new Error('Email or phone number is required.');
+    }
+
+    const requestedUiChannel: 'email' | 'sms' =
+      input.channel === 'sms' || (!input.channel && !rawIdentifier.includes('@')) ? 'sms' : 'email';
+    const dbChannel: 'email' | 'phone' = requestedUiChannel === 'sms' ? 'phone' : 'email';
+
+    const user = await this.findUserByIdentifier(rawIdentifier);
+    if (!user || user.deleted_at || user.is_blocked) {
+      return {
+        ok: true,
+        channel: requestedUiChannel,
+        deliveryConfigured: true,
+        expiresInSeconds: 600,
+      };
+    }
+
+    const target = dbChannel === 'email' ? user.email : user.phone;
+    if (!target || !target.trim()) {
+      return {
+        ok: true,
+        channel: requestedUiChannel,
+        deliveryConfigured: true,
+        expiresInSeconds: 600,
+      };
+    }
+
+    const locale = user.preferred_locale === 'ar' ? 'ar' : 'en';
+    const dispatched = await this.db.transaction(async (tx) => {
+      const res = await this.dispatchOtpChallenge(tx, {
+        userId: user.id,
+        userName: user.name,
+        channel: dbChannel,
+        target,
+        purpose: 'password_reset_otp',
+        locale,
+      });
+      await writeAuditLog(tx, {
+        actorUserId: user.id,
+        action: `auth.password_reset_otp_requested.${dbChannel}`,
+        entityType: 'user',
+        entityId: user.id,
+        ipAddress,
+      });
+      return res;
+    });
+
+    const isDevOrTest = process.env.NODE_ENV !== 'production';
+    return {
+      ok: true,
+      channel: requestedUiChannel,
+      deliveryConfigured: dispatched.deliveryConfigured,
+      expiresInSeconds: 600,
+      ...(isDevOrTest && !dispatched.deliveryConfigured ? { devOtpCode: dispatched.code } : {}),
+    };
+  }
+
+  async verifyPasswordResetOtp(
+    input: { identifier: string; code: string; channel?: 'email' | 'sms' },
+    ipAddress?: string
+  ): Promise<{ ok: boolean; resetToken: string; expiresInSeconds: number }> {
+    const rawIdentifier = input.identifier.trim();
+    const cleanCode = input.code.replace(/\s+/g, '');
+    if (!/^\d{6}$/.test(cleanCode)) {
+      throw new Error('Please enter the 6-digit reset verification code.');
+    }
+
+    const user = await this.findUserByIdentifier(rawIdentifier);
+    if (!user || user.deleted_at || user.is_blocked) {
+      throw new Error('Invalid or expired verification code.');
+    }
+
+    const dbChannel: 'email' | 'phone' =
+      input.channel === 'sms' || (!input.channel && !rawIdentifier.includes('@')) ? 'phone' : 'email';
+    const now = toSqlTimestamp();
+
+    const txRes = await this.db.transaction(async (tx) => {
+      const challenge = await tx.queryOne<{
+        id: string;
+        code_hash: string;
+        attempts: number;
+        expires_at: string;
+      }>(
+        `SELECT id, code_hash, attempts, expires_at
+         FROM verification_codes
+         WHERE user_id = ? AND channel = ? AND purpose = 'password_reset_otp' AND consumed_at IS NULL
+         ORDER BY created_at DESC LIMIT 1`,
+        [user.id, dbChannel]
+      );
+
+      if (!challenge || String(challenge.expires_at) <= now) {
+        throw new Error('Reset verification code expired or not found. Request a new OTP.');
+      }
+      if (Number(challenge.attempts) >= 5) {
+        throw new Error('Too many failed verification attempts. Please request a new OTP code.');
+      }
+
+      const submittedHash = hashOtpCode(user.id, dbChannel, 'password_reset_otp', cleanCode);
+      if (!timingSafeStringMatch(challenge.code_hash, submittedHash)) {
+        await tx.execute('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?', [challenge.id]);
+        return { failed: true as const, message: 'Invalid 6-digit verification code.' };
+      }
+
+      await tx.execute('UPDATE verification_codes SET consumed_at = ? WHERE id = ?', [now, challenge.id]);
+
+      const rawResetToken = crypto.randomBytes(24).toString('hex');
+      const tokenHash = sha256Hex(rawResetToken);
+      const resetExpiresAt = toSqlTimestamp(new Date(Date.now() + 15 * 60_000));
+
+      await tx.execute(
+        `UPDATE password_resets SET used_at = ? WHERE user_id = ? AND purpose = 'password_reset' AND used_at IS NULL`,
+        [now, user.id]
+      );
+      await tx.execute(
+        `INSERT INTO password_resets (id, user_id, token_hash, purpose, expires_at, used_at, created_at)
+         VALUES (?, ?, ?, 'password_reset', ?, NULL, ?)`,
+        [`pwr-${crypto.randomUUID()}`, user.id, tokenHash, resetExpiresAt, now]
+      );
+
+      await writeAuditLog(tx, {
+        actorUserId: user.id,
+        action: `auth.password_reset_otp_verified.${dbChannel}`,
+        entityType: 'user',
+        entityId: user.id,
+        ipAddress,
+      });
+
+      return { failed: false as const, resetToken: rawResetToken };
+    });
+
+    if (txRes.failed) {
+      throw new Error(txRes.message);
+    }
+    return {
+      ok: true,
+      resetToken: txRes.resetToken,
+      expiresInSeconds: 900,
+    };
   }
 
   async requestPasswordReset(email: string, ipAddress?: string): Promise<{ ok: boolean; devResetToken?: string }> {
@@ -7837,6 +8910,15 @@ export class MarketplaceRepo {
         after: { titleEn: nextTitle.en, basePriceUsdCents: patch.basePriceUsdCents },
         ipAddress,
       });
+
+      const prevPrice = Number(existing.base_price_usd_cents);
+      if (patch.basePriceUsdCents !== undefined && patch.basePriceUsdCents < prevPrice) {
+        await this.notifyWishlistPriceDrop(tx, {
+          productId,
+          oldPriceUsdCents: prevPrice,
+          newPriceUsdCents: patch.basePriceUsdCents,
+        });
+      }
 
       const updated = await tx.queryOne<Record<string, unknown>>('SELECT * FROM products WHERE id = ?', [productId]);
       const [mapped] = await this.mapProductRows([updated!], tx);
@@ -8809,28 +9891,69 @@ export class MarketplaceRepo {
   async adminUpdateUserAccess(
     userId: string,
     actorUserId: string,
-    patch: { isBlocked?: boolean; permissions?: string[] },
+    patch: {
+      isBlocked?: boolean;
+      verifyEmail?: boolean;
+      verifyPhone?: boolean;
+      roleKey?: 'customer' | 'seller_owner' | 'seller_staff' | 'admin_staff';
+      permissions?: string[];
+      reason?: string;
+    },
     ipAddress?: string
   ) {
     return this.db.transaction(async (tx) => {
-      const target = await tx.queryOne<{ id: string; role_key: string; is_blocked: number | boolean }>(
-        'SELECT id, role_key, is_blocked FROM users WHERE id = ? AND deleted_at IS NULL',
+      const actor = await tx.queryOne<{ role_key: string }>('SELECT role_key FROM users WHERE id = ?', [actorUserId]);
+      const target = await tx.queryOne<{
+        id: string;
+        role_key: string;
+        is_blocked: number | boolean;
+        email_verified_at: string | null;
+        phone_verified_at: string | null;
+      }>(
+        'SELECT id, role_key, is_blocked, email_verified_at, phone_verified_at FROM users WHERE id = ? AND deleted_at IS NULL',
         [userId]
       );
       if (!target) throw new Error('User not found.');
       if (target.role_key === 'admin_super' && patch.isBlocked) {
-        throw new Error('Cannot block a Super Admin account.');
+        throw new Error('Cannot deactivate or block a Super Admin account.');
+      }
+
+      const now = toSqlTimestamp();
+      if (patch.roleKey !== undefined && patch.roleKey !== target.role_key) {
+        if (target.role_key === 'admin_super') {
+          throw new Error('Super Admin role cannot be reassigned.');
+        }
+        if (actor?.role_key !== 'admin_super') {
+          throw new Error('Only Super Admin can change user roles.');
+        }
+        await tx.execute('UPDATE users SET role_key = ?, updated_at = ? WHERE id = ?', [patch.roleKey, now, userId]);
       }
 
       if (patch.isBlocked !== undefined) {
         await tx.execute('UPDATE users SET is_blocked = ?, updated_at = ? WHERE id = ?', [
           patch.isBlocked ? 1 : 0,
-          toSqlTimestamp(),
+          now,
           userId,
         ]);
         if (patch.isBlocked) {
           await tx.execute('DELETE FROM sessions WHERE user_id = ?', [userId]);
         }
+      }
+
+      if (patch.verifyEmail !== undefined) {
+        await tx.execute('UPDATE users SET email_verified_at = ?, updated_at = ? WHERE id = ?', [
+          patch.verifyEmail ? now : null,
+          now,
+          userId,
+        ]);
+      }
+
+      if (patch.verifyPhone !== undefined) {
+        await tx.execute('UPDATE users SET phone_verified_at = ?, updated_at = ? WHERE id = ?', [
+          patch.verifyPhone ? now : null,
+          now,
+          userId,
+        ]);
       }
 
       if (patch.permissions !== undefined) {
@@ -8844,17 +9967,486 @@ export class MarketplaceRepo {
         }
       }
 
+      const cleanedReason = patch.reason ? patch.reason.trim().slice(0, 300) : undefined;
       await writeAuditLog(tx, {
         actorUserId,
-        action: 'admin.update_user_access',
+        action:
+          patch.isBlocked === true
+            ? 'admin.deactivate_user'
+            : patch.isBlocked === false
+              ? 'admin.reactivate_user'
+              : 'admin.update_user_access',
         entityType: 'user',
         entityId: userId,
-        after: patch,
+        before: {
+          roleKey: target.role_key,
+          isBlocked: Boolean(target.is_blocked),
+          emailVerified: Boolean(target.email_verified_at),
+          phoneVerified: Boolean(target.phone_verified_at),
+        },
+        after: { ...patch, ...(cleanedReason ? { reason: cleanedReason } : {}) },
         ipAddress,
       });
 
-      return { ok: true, userId };
+      const refreshed = await tx.queryOne<{
+        is_blocked: number | boolean;
+        email_verified_at: string | null;
+        phone_verified_at: string | null;
+      }>('SELECT is_blocked, email_verified_at, phone_verified_at FROM users WHERE id = ?', [userId]);
+      const emailVerifiedAt = refreshed?.email_verified_at ? String(refreshed.email_verified_at) : null;
+      const phoneVerifiedAt = refreshed?.phone_verified_at ? String(refreshed.phone_verified_at) : null;
+      return {
+        ok: true,
+        userId,
+        isBlocked: Boolean(refreshed?.is_blocked),
+        emailVerifiedAt,
+        phoneVerifiedAt,
+        isFullyVerified: Boolean(emailVerifiedAt && phoneVerifiedAt),
+      };
     });
+  }
+
+  async getAdminUserActivity(userId: string): Promise<AdminUserActivityPayload> {
+    const userRow = await this.db.queryOne<{
+      id: string;
+      name: string;
+      email: string;
+      phone: string;
+      role_key: string;
+      is_blocked: number | boolean;
+      totp_enabled: number | boolean;
+      email_verified_at: string | null;
+      phone_verified_at: string | null;
+      preferred_locale: string;
+      preferred_currency: string;
+      failed_login_attempts: number;
+      locked_until: string | null;
+      created_at: string;
+      updated_at: string;
+    }>(
+      `SELECT id, name, email, phone, role_key, is_blocked, totp_enabled,
+              email_verified_at, phone_verified_at, preferred_locale, preferred_currency,
+              failed_login_attempts, locked_until, created_at, updated_at
+       FROM users WHERE id = ? AND deleted_at IS NULL LIMIT 1`,
+      [userId]
+    );
+    if (!userRow) throw new Error('User not found.');
+
+    const [
+      permRows,
+      sellerRow,
+      orderAgg,
+      recentOrderRows,
+      recentReviewRows,
+      reviewCntRow,
+      recentTicketRows,
+      ticketCntRow,
+      sessionCntRow,
+      auditRows,
+    ] = await Promise.all([
+      this.db.query<{ permission_key: string }>('SELECT permission_key FROM user_permissions WHERE user_id = ?', [userId]),
+      this.db.queryOne<{
+        id: string;
+        status: string;
+        verified: number | boolean;
+        slug: string;
+        name_json: string;
+      }>(
+        `SELECT sel.id, sel.status, sel.verified, st.slug, st.name_json
+         FROM sellers sel INNER JOIN stores st ON st.seller_id = sel.id
+         WHERE sel.owner_user_id = ? AND sel.deleted_at IS NULL LIMIT 1`,
+        [userId]
+      ),
+      this.db.queryOne<{ cnt: number; total_spent: number }>(
+        'SELECT COUNT(*) AS cnt, COALESCE(SUM(grand_total_usd_cents), 0) AS total_spent FROM orders WHERE user_id = ?',
+        [userId]
+      ),
+      this.db.query<{
+        id: string;
+        order_number: string;
+        grand_total_usd_cents: number;
+        payment_method: string;
+        payment_status: string;
+        created_at: string;
+      }>(
+        'SELECT id, order_number, grand_total_usd_cents, payment_method, payment_status, created_at FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 15',
+        [userId]
+      ),
+      this.db.query<{
+        id: string;
+        product_id: string;
+        rating: number;
+        comment: string;
+        moderation_status: string;
+        created_at: string;
+      }>(
+        'SELECT id, product_id, rating, comment, moderation_status, created_at FROM reviews WHERE user_id = ? ORDER BY created_at DESC LIMIT 10',
+        [userId]
+      ),
+      this.db.queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM reviews WHERE user_id = ?', [userId]),
+      this.db.query<{
+        id: string;
+        subject: string;
+        status: string;
+        created_at: string;
+      }>(
+        'SELECT id, subject, status, created_at FROM support_tickets WHERE user_id = ? ORDER BY created_at DESC LIMIT 10',
+        [userId]
+      ),
+      this.db.queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM support_tickets WHERE user_id = ?', [userId]),
+      this.db.queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM sessions WHERE user_id = ?', [userId]),
+      this.db.query<Record<string, unknown>>(
+        `SELECT * FROM audit_log
+         WHERE actor_user_id = ? OR (entity_type = 'user' AND entity_id = ?)
+         ORDER BY created_at DESC LIMIT 80`,
+        [userId, userId]
+      ),
+    ]);
+
+    const emailVerifiedAt = userRow.email_verified_at ? String(userRow.email_verified_at) : null;
+    const phoneVerifiedAt = userRow.phone_verified_at ? String(userRow.phone_verified_at) : null;
+    const auditEvents: AuditLogEntry[] = auditRows.map((a) => ({
+      id: String(a.id),
+      actorUserId: a.actor_user_id ? String(a.actor_user_id) : null,
+      action: String(a.action),
+      entityType: String(a.entity_type),
+      entityId: String(a.entity_id),
+      beforeJson: a.before_json ? String(a.before_json) : null,
+      afterJson: a.after_json ? String(a.after_json) : null,
+      ipAddress: a.ip_address ? String(a.ip_address) : null,
+      createdAt: String(a.created_at),
+    }));
+
+    return {
+      user: {
+        id: userRow.id,
+        name: userRow.name,
+        email: userRow.email,
+        phone: userRow.phone,
+        roleKey: userRow.role_key,
+        isBlocked: Boolean(userRow.is_blocked),
+        totpEnabled: Boolean(userRow.totp_enabled),
+        emailVerifiedAt,
+        phoneVerifiedAt,
+        isFullyVerified: Boolean(emailVerifiedAt && phoneVerifiedAt),
+        permissions: permRows.map((p) => p.permission_key),
+        ordersCount: Number(orderAgg?.cnt ?? 0),
+        activeSessionsCount: Number(sessionCntRow?.cnt ?? 0),
+        sellerId: sellerRow?.id ?? null,
+        sellerName: sellerRow ? parseJson<LocalizedText>(sellerRow.name_json, { en: sellerRow.slug, ar: sellerRow.slug }).en : null,
+        lastActivityAt: auditEvents[0]?.createdAt ?? String(userRow.updated_at),
+        createdAt: String(userRow.created_at),
+        preferredLocale: (userRow.preferred_locale === 'ar' ? 'ar' : 'en') as Locale,
+        preferredCurrency: (userRow.preferred_currency === 'LBP' ? 'LBP' : 'USD') as Currency,
+        failedLoginAttempts: Number(userRow.failed_login_attempts ?? 0),
+        lockedUntil: userRow.locked_until ? String(userRow.locked_until) : null,
+        updatedAt: String(userRow.updated_at),
+        seller: sellerRow
+          ? {
+              id: sellerRow.id,
+              slug: sellerRow.slug,
+              name: parseJson<LocalizedText>(sellerRow.name_json, { en: sellerRow.slug, ar: sellerRow.slug }),
+              status: sellerRow.status as SellerStatus,
+              verified: Boolean(sellerRow.verified),
+            }
+          : null,
+      },
+      stats: {
+        ordersCount: Number(orderAgg?.cnt ?? 0),
+        totalSpentUsdCents: Number(orderAgg?.total_spent ?? 0),
+        reviewsCount: Number(reviewCntRow?.cnt ?? 0),
+        ticketsCount: Number(ticketCntRow?.cnt ?? 0),
+        activeSessionsCount: Number(sessionCntRow?.cnt ?? 0),
+        auditEventsCount: auditEvents.length,
+      },
+      recentOrders: recentOrderRows.map((o) => ({
+        id: o.id,
+        orderNumber: o.order_number,
+        grandTotalUsdCents: Number(o.grand_total_usd_cents),
+        paymentMethod: o.payment_method,
+        paymentStatus: o.payment_status,
+        createdAt: String(o.created_at),
+      })),
+      recentReviews: recentReviewRows.map((rv) => ({
+        id: rv.id,
+        productId: rv.product_id,
+        rating: Number(rv.rating),
+        comment: rv.comment,
+        moderationStatus: rv.moderation_status,
+        createdAt: String(rv.created_at),
+      })),
+      recentTickets: recentTicketRows.map((tk) => ({
+        id: tk.id,
+        subject: tk.subject,
+        status: tk.status,
+        createdAt: String(tk.created_at),
+      })),
+      auditEvents,
+    };
+  }
+
+  // --- Customer <-> Store Owner System Chat ---
+  private mapChatConversationRow(r: Record<string, unknown>): ChatConversation {
+    return {
+      id: String(r.id),
+      sellerId: String(r.seller_id),
+      sellerName: parseJson<LocalizedText>(r.seller_name_json, {
+        en: String(r.seller_legal_name || 'Store'),
+        ar: String(r.seller_legal_name || 'المتجر'),
+      }),
+      sellerSlug: String(r.seller_slug || ''),
+      customerUserId: String(r.customer_user_id),
+      customerName: String(r.customer_name),
+      productId: r.product_id ? String(r.product_id) : null,
+      productTitle: r.product_title_json ? parseJson<LocalizedText | null>(r.product_title_json, null) : null,
+      status: String(r.status || 'open') === 'closed' ? 'closed' : 'open',
+      unreadForSeller: Number(r.unread_for_seller || 0),
+      unreadForCustomer: Number(r.unread_for_customer || 0),
+      lastMessagePreview: r.last_message_preview ? String(r.last_message_preview) : undefined,
+      lastMessageAt: String(r.last_message_at),
+      createdAt: String(r.created_at),
+    };
+  }
+
+  private assertChatParticipant(conv: { customer_user_id: string; seller_id: string }, user: AuthContextUser) {
+    if (conv.customer_user_id === user.id) return;
+    if (user.sellerId && conv.seller_id === user.sellerId) return;
+    if (isAdminRole(user.roleKey)) return;
+    throw new Error('Forbidden: you do not have access to this conversation.');
+  }
+
+  async listChatConversations(user: AuthContextUser, sellerFilterId?: string): Promise<ChatConversation[]> {
+    const baseSelect = `
+      SELECT c.*, st.name_json AS seller_name_json, st.slug AS seller_slug, sel.legal_name AS seller_legal_name,
+             p.title_json AS product_title_json
+      FROM chat_conversations c
+      INNER JOIN sellers sel ON sel.id = c.seller_id
+      INNER JOIN stores st ON st.seller_id = c.seller_id
+      LEFT JOIN products p ON p.id = c.product_id
+    `;
+    let rows: Record<string, unknown>[];
+    if (isAdminRole(user.roleKey) && sellerFilterId) {
+      rows = await this.db.query<Record<string, unknown>>(
+        `${baseSelect} WHERE c.seller_id = ? ORDER BY c.last_message_at DESC LIMIT 80`,
+        [sellerFilterId]
+      );
+    } else if (user.sellerId && (!sellerFilterId || sellerFilterId === user.sellerId)) {
+      rows = await this.db.query<Record<string, unknown>>(
+        `${baseSelect} WHERE c.seller_id = ? OR c.customer_user_id = ? ORDER BY c.last_message_at DESC LIMIT 80`,
+        [user.sellerId, user.id]
+      );
+    } else {
+      rows = await this.db.query<Record<string, unknown>>(
+        `${baseSelect} WHERE c.customer_user_id = ? ORDER BY c.last_message_at DESC LIMIT 80`,
+        [user.id]
+      );
+    }
+    return rows.map((r) => this.mapChatConversationRow(r));
+  }
+
+  async startOrSendChatConversation(
+    user: AuthContextUser,
+    input: { sellerId: string; productId?: string; body: string }
+  ): Promise<{ conversation: ChatConversation; message: ChatMessage }> {
+    const cleanBody = input.body.trim();
+    if (!cleanBody) throw new Error('Message text is required.');
+    if (user.sellerId && user.sellerId === input.sellerId) {
+      throw new Error('You cannot start a customer inquiry with your own storefront.');
+    }
+
+    const seller = await this.db.queryOne<{ id: string }>(
+      "SELECT id FROM sellers WHERE id = ? AND status = 'approved' AND deleted_at IS NULL",
+      [input.sellerId]
+    );
+    if (!seller) throw new Error('Storefront not found or unavailable.');
+
+    const cleanProdId = input.productId?.trim() || null;
+    if (cleanProdId) {
+      const prod = await this.db.queryOne<{ id: string }>(
+        'SELECT id FROM products WHERE id = ? AND seller_id = ? AND deleted_at IS NULL',
+        [cleanProdId, input.sellerId]
+      );
+      if (!prod) throw new Error('Product does not belong to this storefront.');
+    }
+
+    const now = toSqlTimestamp();
+    const preview = cleanBody.slice(0, 180);
+
+    return this.db.transaction(async (tx) => {
+      let existing = await tx.queryOne<{ id: string }>(
+        cleanProdId
+          ? 'SELECT id FROM chat_conversations WHERE seller_id = ? AND customer_user_id = ? AND product_id = ? LIMIT 1'
+          : 'SELECT id FROM chat_conversations WHERE seller_id = ? AND customer_user_id = ? AND product_id IS NULL LIMIT 1',
+        cleanProdId ? [input.sellerId, user.id, cleanProdId] : [input.sellerId, user.id]
+      );
+
+      let convId = existing?.id;
+      if (!convId) {
+        convId = `cht-${crypto.randomUUID()}`;
+        await tx.execute(
+          `INSERT INTO chat_conversations
+             (id, seller_id, customer_user_id, customer_name, product_id, status, unread_for_seller, unread_for_customer, last_message_preview, last_message_at, created_at)
+           VALUES (?, ?, ?, ?, ?, 'open', 1, 0, ?, ?, ?)`,
+          [convId, input.sellerId, user.id, user.name, cleanProdId, preview, now, now]
+        );
+      } else {
+        await tx.execute(
+          `UPDATE chat_conversations
+           SET status = 'open', unread_for_seller = unread_for_seller + 1, last_message_preview = ?, last_message_at = ?
+           WHERE id = ?`,
+          [preview, now, convId]
+        );
+      }
+
+      const msgId = `msg-${crypto.randomUUID()}`;
+      await tx.execute(
+        `INSERT INTO chat_messages (id, conversation_id, sender_role, sender_user_id, body, read_at, created_at)
+         VALUES (?, ?, 'customer', ?, ?, NULL, ?)`,
+        [msgId, convId, user.id, cleanBody, now]
+      );
+
+      const convRow = await tx.queryOne<Record<string, unknown>>(
+        `SELECT c.*, st.name_json AS seller_name_json, st.slug AS seller_slug, sel.legal_name AS seller_legal_name,
+                p.title_json AS product_title_json
+         FROM chat_conversations c
+         INNER JOIN sellers sel ON sel.id = c.seller_id
+         INNER JOIN stores st ON st.seller_id = c.seller_id
+         LEFT JOIN products p ON p.id = c.product_id
+         WHERE c.id = ? LIMIT 1`,
+        [convId]
+      );
+      return {
+        conversation: this.mapChatConversationRow(convRow!),
+        message: {
+          id: msgId,
+          conversationId: convId,
+          senderRole: 'customer',
+          senderUserId: user.id,
+          body: cleanBody,
+          readAt: null,
+          createdAt: now,
+        },
+      };
+    });
+  }
+
+  async getChatConversationMessages(
+    conversationId: string,
+    user: AuthContextUser
+  ): Promise<{ conversation: ChatConversation; messages: ChatMessage[] }> {
+    const convRow = await this.db.queryOne<Record<string, unknown>>(
+      `SELECT c.*, st.name_json AS seller_name_json, st.slug AS seller_slug, sel.legal_name AS seller_legal_name,
+              p.title_json AS product_title_json
+       FROM chat_conversations c
+       INNER JOIN sellers sel ON sel.id = c.seller_id
+       INNER JOIN stores st ON st.seller_id = c.seller_id
+       LEFT JOIN products p ON p.id = c.product_id
+       WHERE c.id = ? LIMIT 1`,
+      [conversationId]
+    );
+    if (!convRow) throw new Error('Conversation not found.');
+    const conv = this.mapChatConversationRow(convRow);
+    this.assertChatParticipant({ customer_user_id: conv.customerUserId, seller_id: conv.sellerId }, user);
+
+    const now = toSqlTimestamp();
+    if (conv.customerUserId === user.id && conv.unreadForCustomer > 0) {
+      await this.db.execute('UPDATE chat_conversations SET unread_for_customer = 0 WHERE id = ?', [conversationId]);
+      await this.db.execute(
+        "UPDATE chat_messages SET read_at = ? WHERE conversation_id = ? AND sender_role != 'customer' AND read_at IS NULL",
+        [now, conversationId]
+      );
+      conv.unreadForCustomer = 0;
+    } else if (user.sellerId && conv.sellerId === user.sellerId && conv.unreadForSeller > 0) {
+      await this.db.execute('UPDATE chat_conversations SET unread_for_seller = 0 WHERE id = ?', [conversationId]);
+      await this.db.execute(
+        "UPDATE chat_messages SET read_at = ? WHERE conversation_id = ? AND sender_role = 'customer' AND read_at IS NULL",
+        [now, conversationId]
+      );
+      conv.unreadForSeller = 0;
+    }
+
+    const msgRows = await this.db.query<Record<string, unknown>>(
+      'SELECT * FROM chat_messages WHERE conversation_id = ? ORDER BY created_at ASC LIMIT 200',
+      [conversationId]
+    );
+    const messages: ChatMessage[] = msgRows.map((m) => ({
+      id: String(m.id),
+      conversationId: String(m.conversation_id),
+      senderRole: String(m.sender_role) as ChatMessage['senderRole'],
+      senderUserId: String(m.sender_user_id),
+      body: String(m.body),
+      readAt: m.read_at ? String(m.read_at) : null,
+      createdAt: String(m.created_at),
+    }));
+    return { conversation: conv, messages };
+  }
+
+  async sendChatMessage(conversationId: string, user: AuthContextUser, body: string): Promise<ChatMessage> {
+    const cleanBody = body.trim();
+    if (!cleanBody) throw new Error('Message text is required.');
+
+    const conv = await this.db.queryOne<{ id: string; seller_id: string; customer_user_id: string }>(
+      'SELECT id, seller_id, customer_user_id FROM chat_conversations WHERE id = ?',
+      [conversationId]
+    );
+    if (!conv) throw new Error('Conversation not found.');
+    this.assertChatParticipant(conv, user);
+
+    const senderRole: ChatMessage['senderRole'] =
+      (user.sellerId && conv.seller_id === user.sellerId) ||
+      (isAdminRole(user.roleKey) && conv.customer_user_id !== user.id)
+        ? 'seller'
+        : 'customer';
+    const now = toSqlTimestamp();
+    const preview = cleanBody.slice(0, 180);
+    const msgId = `msg-${crypto.randomUUID()}`;
+
+    await this.db.transaction(async (tx) => {
+      await tx.execute(
+        `INSERT INTO chat_messages (id, conversation_id, sender_role, sender_user_id, body, read_at, created_at)
+         VALUES (?, ?, ?, ?, ?, NULL, ?)`,
+        [msgId, conversationId, senderRole, user.id, cleanBody, now]
+      );
+      if (senderRole === 'customer') {
+        await tx.execute(
+          `UPDATE chat_conversations
+           SET status = 'open', unread_for_seller = unread_for_seller + 1, last_message_preview = ?, last_message_at = ?
+           WHERE id = ?`,
+          [preview, now, conversationId]
+        );
+      } else {
+        await tx.execute(
+          `UPDATE chat_conversations
+           SET status = 'open', unread_for_customer = unread_for_customer + 1, last_message_preview = ?, last_message_at = ?
+           WHERE id = ?`,
+          [preview, now, conversationId]
+        );
+      }
+    });
+
+    return {
+      id: msgId,
+      conversationId,
+      senderRole,
+      senderUserId: user.id,
+      body: cleanBody,
+      readAt: null,
+      createdAt: now,
+    };
+  }
+
+  async updateChatConversationStatus(
+    conversationId: string,
+    user: AuthContextUser,
+    status: 'open' | 'closed'
+  ): Promise<void> {
+    const conv = await this.db.queryOne<{ id: string; seller_id: string; customer_user_id: string }>(
+      'SELECT id, seller_id, customer_user_id FROM chat_conversations WHERE id = ?',
+      [conversationId]
+    );
+    if (!conv) throw new Error('Conversation not found.');
+    this.assertChatParticipant(conv, user);
+    await this.db.execute('UPDATE chat_conversations SET status = ? WHERE id = ?', [status, conversationId]);
   }
 
   async releaseHoldsNow(actorUserId: string, ipAddress?: string) {

@@ -223,7 +223,9 @@ export function ProductCard({
           <button
             type="button"
             onClick={() => toggleWishlist(product.id)}
-            aria-label={isWished ? 'Remove from wishlist' : 'Add to wishlist'}
+            aria-pressed={isWished}
+            aria-label={isWished ? (locale === 'ar' ? 'إزالة من المفضلة' : 'Remove from wishlist') : (locale === 'ar' ? 'أضف إلى المفضلة' : 'Add to wishlist')}
+            title={isWished ? (locale === 'ar' ? 'في المفضلة' : 'In wishlist') : (locale === 'ar' ? 'أضف إلى المفضلة' : 'Save to wishlist')}
             className="absolute top-2.5 end-2.5 w-9 h-9 flex items-center justify-center bg-[var(--ink)]/85 border border-[var(--line)] text-[var(--bone)] hover:border-[var(--ember)] cursor-pointer"
           >
             <Heart className={`w-4 h-4 ${isWished ? 'fill-[var(--ember)] text-[var(--ember)]' : ''}`} />

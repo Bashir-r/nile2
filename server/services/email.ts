@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import nodemailer from 'nodemailer';
 import type { DbClient, DbTx } from '../db/client.ts';
-import type { EmailBlock, Locale } from '../../src/shared/types.ts';
+import type { EmailBlock, EmailSummaryFrequency, Locale, LocalizedText, NotificationCategory } from '../../src/shared/types.ts';
 import { toSqlTimestamp } from './security.ts';
 
 export interface EmailSendPayload {
@@ -367,3 +367,351 @@ export async function processMarketingEmailJob(db: DbClient, payload: MarketingE
     await db.execute('UPDATE automation_flows SET total_sent = total_sent + 1 WHERE id = ?', [payload.flowId]);
   }
 }
+
+export interface NotificationSummaryEntry {
+  id: string;
+  category: NotificationCategory;
+  title: LocalizedText;
+  body: LocalizedText;
+  actionUrl?: string | null;
+  createdAt: string;
+}
+
+export interface NotificationSummaryResult {
+  ok: boolean;
+  sentCount: number;
+  status: 'sent' | 'unconfigured' | 'failed' | 'empty';
+  error?: string;
+  previewSubject: string;
+  previewText: string;
+  lastSummarySentAt: string | null;
+}
+
+const CATEGORY_LABELS: Record<NotificationCategory, { en: string; ar: string; color: string }> = {
+  order: { en: 'Order Status Updates', ar: 'تحديثات حالة الطلبات', color: '#06B6D4' },
+  price_drop: { en: 'Wishlisted Price Drops', ar: 'انخفاض أسعار المفضلة', color: '#65A30D' },
+  promo: { en: 'Promotional Offers', ar: 'العروض الترويجية', color: '#EA580C' },
+  system: { en: 'Marketplace Updates', ar: 'تحديثات المنصة', color: '#D97706' },
+};
+
+export function renderNotificationSummaryEmail(opts: {
+  userName: string;
+  locale: Locale;
+  frequency?: EmailSummaryFrequency;
+  appUrl?: string;
+  notifications: NotificationSummaryEntry[];
+}): { subject: string; html: string; text: string } {
+  const locale: Locale = opts.locale === 'ar' ? 'ar' : 'en';
+  const dir = locale === 'ar' ? 'rtl' : 'ltr';
+  const baseUrl = (opts.appUrl || process.env.APP_URL || 'https://nilelink.lb').replace(/\/$/, '');
+  const count = opts.notifications.length;
+  const freqLabel =
+    opts.frequency === 'instant'
+      ? locale === 'ar'
+        ? 'تنبيه فوري'
+        : 'Instant Alert'
+      : opts.frequency === 'weekly'
+        ? locale === 'ar'
+          ? 'الملخص الأسبوعي'
+          : 'Weekly Summary'
+        : locale === 'ar'
+          ? 'الملخص اليومي'
+          : 'Daily Summary';
+
+  const subject =
+    locale === 'ar'
+      ? `نايل لينك — ${freqLabel} (${count} ${count === 1 ? 'إشعار' : 'إشعارات'})`
+      : `NileLink ${freqLabel} · ${count} ${count === 1 ? 'update' : 'updates'}`;
+
+  const grouped = new Map<NotificationCategory, NotificationSummaryEntry[]>();
+  for (const n of opts.notifications) {
+    const cat: NotificationCategory = n.category || 'system';
+    const arr = grouped.get(cat) || [];
+    arr.push(n);
+    grouped.set(cat, arr);
+  }
+
+  const orderOrder: NotificationCategory[] = ['order', 'price_drop', 'promo', 'system'];
+  const textSections: string[] = [
+    locale === 'ar'
+      ? `مرحباً ${opts.userName}، إليك ملخص إشعاراتك على نايل لينك:`
+      : `Hello ${opts.userName}, here is your NileLink notifications digest:`,
+  ];
+  const htmlSections: string[] = [];
+
+  for (const cat of orderOrder) {
+    const items = grouped.get(cat);
+    if (!items || items.length === 0) continue;
+    const labelMeta = CATEGORY_LABELS[cat];
+    const heading = locale === 'ar' ? labelMeta.ar : labelMeta.en;
+    textSections.push(`\n## ${heading}`);
+    const itemCards: string[] = [];
+
+    for (const item of items) {
+      const title = locale === 'ar' ? item.title.ar || item.title.en : item.title.en || item.title.ar;
+      const body = locale === 'ar' ? item.body.ar || item.body.en : item.body.en || item.body.ar;
+      const href = safeEmailUrl(item.actionUrl || '/account?tab=notifications', baseUrl);
+      textSections.push(`- ${title}: ${body} (${href})`);
+      itemCards.push(
+        `<div style="padding:12px 14px;border:1px solid #30343B;background:#17181B;margin-bottom:8px;">
+          <div style="font-size:14px;font-weight:bold;color:#F3EFE8;">${escapeHtml(title)}</div>
+          <div style="margin-top:4px;font-size:13px;line-height:1.5;color:#C7C4BC;">${escapeHtml(body)}</div>
+          <div style="margin-top:8px;">
+            <a href="${escapeHtml(href)}" style="font-size:11px;font-weight:bold;text-transform:uppercase;color:${labelMeta.color};text-decoration:none;border-bottom:1px solid ${labelMeta.color};">${
+          locale === 'ar' ? 'عرض التفاصيل' : 'Open Details'
+        }</a>
+          </div>
+        </div>`
+      );
+    }
+
+    htmlSections.push(
+      `<div style="padding:18px 24px;border-bottom:1px solid #30343B;background:#222428;">
+        <div style="font-family:monospace;font-size:11px;font-weight:bold;text-transform:uppercase;letter-spacing:1.5px;color:${labelMeta.color};margin-bottom:10px;">
+          ${escapeHtml(heading)} (${items.length})
+        </div>
+        ${itemCards.join('')}
+      </div>`
+    );
+  }
+
+  const prefsUrl = `${baseUrl}/account?tab=notifications`;
+  textSections.push(
+    locale === 'ar' ? `\nإدارة تفضيلات الإشعارات: ${prefsUrl}` : `\nManage notification preferences: ${prefsUrl}`
+  );
+
+  const html = `<!doctype html>
+<html lang="${locale}" dir="${dir}">
+  <body style="margin:0;padding:24px 12px;background:#111215;font-family:Arial,Helvetica,sans-serif;color:#F3EFE8;">
+    <div style="max-width:600px;margin:0 auto;border:1px solid #30343B;background:#222428;">
+      <div style="padding:20px 24px;border-bottom:1px solid #30343B;background:#17181B;">
+        <div style="font-family:monospace;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#EA580C;">NILELINK LEBANON · ${escapeHtml(freqLabel)}</div>
+        <h1 style="margin:6px 0 0;font-size:20px;line-height:1.3;color:#F3EFE8;">${escapeHtml(
+          locale === 'ar' ? `مرحباً ${opts.userName}` : `Hello ${opts.userName}`
+        )}</h1>
+      </div>
+      ${htmlSections.join('\n')}
+      <div style="padding:16px 24px;background:#17181B;font-size:11px;color:#9CA3AF;text-align:center;">
+        <a href="${escapeHtml(prefsUrl)}" style="color:#C7C4BC;text-decoration:underline;">
+          ${locale === 'ar' ? 'تعديل تفضيلات البريد الإلكتروني والإشعارات' : 'Manage Email Digest & Notification Preferences'}
+        </a>
+      </div>
+    </div>
+  </body>
+</html>`;
+
+  return { subject, html, text: textSections.join('\n') };
+}
+
+export async function sendNotificationSummaryForUser(
+  db: DbClient,
+  userId: string,
+  opts: { force?: boolean; singleNotificationId?: string } = {}
+): Promise<NotificationSummaryResult> {
+  const user = await db.queryOne<{
+    id: string;
+    name: string;
+    email: string;
+    preferred_locale: string;
+    deleted_at: string | null;
+    is_blocked: number | boolean;
+  }>(
+    'SELECT id, name, email, preferred_locale, deleted_at, is_blocked FROM users WHERE id = ? LIMIT 1',
+    [userId]
+  );
+  if (!user || user.deleted_at || user.is_blocked || !user.email) {
+    return {
+      ok: false,
+      sentCount: 0,
+      status: 'empty',
+      error: 'Active user email not found.',
+      previewSubject: '',
+      previewText: '',
+      lastSummarySentAt: null,
+    };
+  }
+
+  const prefRow = await db.queryOne<{
+    email_summary_enabled: number | boolean;
+    summary_frequency: string;
+    order_updates: number | boolean;
+    price_drops: number | boolean;
+    promotional_offers: number | boolean;
+    last_summary_sent_at: string | null;
+  }>('SELECT * FROM notification_preferences WHERE user_id = ?', [userId]);
+
+  const frequency = (prefRow?.summary_frequency || 'daily') as EmailSummaryFrequency;
+  const emailEnabled = prefRow ? Boolean(prefRow.email_summary_enabled) : true;
+  if (!opts.force && (!emailEnabled || frequency === 'off')) {
+    return {
+      ok: true,
+      sentCount: 0,
+      status: 'empty',
+      previewSubject: '',
+      previewText: '',
+      lastSummarySentAt: prefRow?.last_summary_sent_at ? String(prefRow.last_summary_sent_at) : null,
+    };
+  }
+
+  let rows: Array<{
+    id: string;
+    category: string;
+    title_json: string;
+    body_json: string;
+    action_url: string | null;
+    created_at: string;
+  }> = [];
+
+  if (opts.singleNotificationId) {
+    rows = await db.query(
+      'SELECT id, category, title_json, body_json, action_url, created_at FROM notifications WHERE id = ? AND user_id = ? LIMIT 1',
+      [opts.singleNotificationId, userId]
+    );
+  } else {
+    rows = await db.query(
+      'SELECT id, category, title_json, body_json, action_url, created_at FROM notifications WHERE user_id = ? AND emailed_at IS NULL AND read_at IS NULL ORDER BY created_at DESC LIMIT 25',
+      [userId]
+    );
+    if (rows.length === 0 && opts.force) {
+      rows = await db.query(
+        'SELECT id, category, title_json, body_json, action_url, created_at FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 15',
+        [userId]
+      );
+    }
+  }
+
+  const allowOrder = prefRow ? Boolean(prefRow.order_updates) : true;
+  const allowPriceDrop = prefRow ? Boolean(prefRow.price_drops) : true;
+  const allowPromo = prefRow ? Boolean(prefRow.promotional_offers) : true;
+
+  const entries: NotificationSummaryEntry[] = [];
+  for (const r of rows) {
+    const cat = (r.category || 'system') as NotificationCategory;
+    if (!opts.force) {
+      if (cat === 'order' && !allowOrder) continue;
+      if (cat === 'price_drop' && !allowPriceDrop) continue;
+      if (cat === 'promo' && !allowPromo) continue;
+    }
+    const tj = typeof r.title_json === 'string' ? JSON.parse(r.title_json) : r.title_json;
+    const bj = typeof r.body_json === 'string' ? JSON.parse(r.body_json) : r.body_json;
+    entries.push({
+      id: r.id,
+      category: cat,
+      title: { en: String(tj?.en || ''), ar: String(tj?.ar || tj?.en || '') },
+      body: { en: String(bj?.en || ''), ar: String(bj?.ar || bj?.en || '') },
+      actionUrl: r.action_url ? String(r.action_url) : null,
+      createdAt: String(r.created_at),
+    });
+  }
+
+  if (entries.length === 0) {
+    return {
+      ok: true,
+      sentCount: 0,
+      status: 'empty',
+      previewSubject: '',
+      previewText: '',
+      lastSummarySentAt: prefRow?.last_summary_sent_at ? String(prefRow.last_summary_sent_at) : null,
+    };
+  }
+
+  const locale: Locale = user.preferred_locale === 'ar' ? 'ar' : 'en';
+  const rendered = renderNotificationSummaryEmail({
+    userName: user.name,
+    locale,
+    frequency: opts.singleNotificationId ? 'instant' : frequency,
+    notifications: entries,
+  });
+
+  const sendRes = await emailAdapter.send({
+    to: user.email,
+    subject: rendered.subject,
+    text: rendered.text,
+    html: rendered.html,
+  });
+
+  const status: 'sent' | 'unconfigured' | 'failed' = sendRes.ok
+    ? 'sent'
+    : emailAdapter.isConfigured()
+      ? 'failed'
+      : 'unconfigured';
+  const now = toSqlTimestamp();
+
+  await db.execute(
+    'INSERT INTO email_log (id, recipient_email, template_key, status, error_message, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+    [
+      `eml-${crypto.randomUUID()}`,
+      user.email,
+      'notification_summary',
+      status,
+      sendRes.error || null,
+      now,
+    ]
+  );
+
+  if (sendRes.ok || opts.force) {
+    const placeholders = entries.map(() => '?').join(', ');
+    await db.execute(`UPDATE notifications SET emailed_at = ? WHERE id IN (${placeholders})`, [
+      now,
+      ...entries.map((e) => e.id),
+    ]);
+    await db.execute(
+      `INSERT INTO notification_preferences (user_id, email_summary_enabled, summary_frequency, order_updates, price_drops, promotional_offers, last_summary_sent_at, updated_at)
+       VALUES (?, 1, ?, 1, 1, 1, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET last_summary_sent_at = excluded.last_summary_sent_at, updated_at = excluded.updated_at`,
+      [userId, frequency, now, now]
+    ).catch(async () => {
+      // MySQL syntax fallback
+      await db.execute(
+        `INSERT INTO notification_preferences (user_id, email_summary_enabled, summary_frequency, order_updates, price_drops, promotional_offers, last_summary_sent_at, updated_at)
+         VALUES (?, 1, ?, 1, 1, 1, ?, ?)
+         ON DUPLICATE KEY UPDATE last_summary_sent_at = VALUES(last_summary_sent_at), updated_at = VALUES(updated_at)`,
+        [userId, frequency, now, now]
+      );
+    });
+  }
+
+  return {
+    ok: sendRes.ok,
+    sentCount: entries.length,
+    status,
+    error: sendRes.error,
+    previewSubject: rendered.subject,
+    previewText: rendered.text,
+    lastSummarySentAt: now,
+  };
+}
+
+export async function dispatchDueNotificationDigests(db: DbClient): Promise<number> {
+  const candidates = await db.query<{ user_id: string }>(
+    `SELECT DISTINCT n.user_id
+     FROM notifications n
+     LEFT JOIN notification_preferences np ON np.user_id = n.user_id
+     INNER JOIN users u ON u.id = n.user_id
+     WHERE n.emailed_at IS NULL
+       AND n.read_at IS NULL
+       AND u.deleted_at IS NULL
+       AND u.is_blocked = 0
+       AND COALESCE(np.email_summary_enabled, 1) = 1
+       AND COALESCE(np.summary_frequency, 'daily') IN ('daily', 'weekly')
+     LIMIT 30`
+  );
+
+  let dispatched = 0;
+  const nowMs = Date.now();
+  for (const row of candidates) {
+    const pref = await db.queryOne<{ summary_frequency: string; last_summary_sent_at: string | null }>(
+      'SELECT summary_frequency, last_summary_sent_at FROM notification_preferences WHERE user_id = ?',
+      [row.user_id]
+    );
+    const freq = pref?.summary_frequency || 'daily';
+    const minAgeMs = freq === 'weekly' ? 6.9 * 86_400_000 : 23 * 3_600_000;
+    const lastMs = pref?.last_summary_sent_at ? Date.parse(pref.last_summary_sent_at) : 0;
+    if (lastMs && nowMs - lastMs < minAgeMs) continue;
+
+    const res = await sendNotificationSummaryForUser(db, row.user_id, { force: false });
+    if (res.sentCount > 0) dispatched++;
+  }
+  return dispatched;
+}
+

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { ExternalLink, FileCheck2, MessageSquareWarning, PackageCheck, ShieldAlert, Truck, Users } from 'lucide-react';
 import type {
+  AdminUserSummary,
   DeliveryZone,
   OrderDispute,
   Product,
@@ -14,17 +15,7 @@ import { useMarketplace } from '../../context/MarketplaceContext.tsx';
 import { toSafeHref } from '../../utils/url.ts';
 import { EmptyState, PriceDisplay, StatusLabel } from '../HairlineUI.tsx';
 
-export interface AdminUserSummary {
-  id: string;
-  name: string;
-  email: string;
-  phone: string;
-  roleKey: string;
-  isBlocked: boolean;
-  totpEnabled: boolean;
-  permissions: string[];
-  createdAt: string;
-}
+export type { AdminUserSummary };
 
 export function AdminCatalogModerationPanel({
   products,
@@ -572,73 +563,186 @@ export function AdminDeliveryZonesEditor({
 export function AdminUserAccessPanel({
   users,
   currentUserId,
+  isSuperAdmin = false,
   onReload,
 }: {
   users: AdminUserSummary[];
   currentUserId: string;
+  isSuperAdmin?: boolean;
   onReload: () => Promise<void>;
 }) {
   const { apiFetch, showToast } = useMarketplace();
   const [search, setSearch] = useState('');
+  const [busyUserId, setBusyUserId] = useState<string | null>(null);
 
   const filtered = users.filter((u) => {
     const q = search.trim().toLowerCase();
-    return !q || u.name.toLowerCase().includes(q) || u.email.toLowerCase().includes(q) || u.roleKey.toLowerCase().includes(q);
+    return (
+      !q ||
+      u.name.toLowerCase().includes(q) ||
+      u.email.toLowerCase().includes(q) ||
+      u.phone.toLowerCase().includes(q) ||
+      u.roleKey.toLowerCase().includes(q)
+    );
   });
+
+  const patchUserAccess = async (
+    u: AdminUserSummary,
+    payload: {
+      isBlocked?: boolean;
+      verifyEmail?: boolean;
+      verifyPhone?: boolean;
+      roleKey?: string;
+    },
+    successMsg: string
+  ) => {
+    setBusyUserId(u.id);
+    try {
+      await apiFetch(`/api/admin/users/${u.id}/access`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload),
+      });
+      showToast(successMsg, 'success');
+      await onReload();
+    } catch (err) {
+      showToast((err as Error).message, 'error');
+    } finally {
+      setBusyUserId(null);
+    }
+  };
 
   return (
     <div className="border border-[var(--line)] bg-[var(--graphite)] p-5 space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2 text-xs font-mono-tabular uppercase text-[var(--cyan)]">
           <Users className="w-4 h-4" />
-          <span>Registered User Accounts &amp; Access Control ({filtered.length})</span>
+          <span>Registered User Accounts, Verification &amp; Access Control ({filtered.length})</span>
         </div>
         <input
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          placeholder="Filter by name, email, role..."
+          placeholder="Filter by name, email, phone, role..."
           className="bg-[var(--ink)] border border-[var(--line)] px-3 py-1.5 text-xs text-[var(--bone)]"
         />
       </div>
 
-      <div className="max-h-72 overflow-y-auto divide-y divide-[var(--line)] border border-[var(--line)]">
-        {filtered.map((u) => (
-          <div key={u.id} className="p-3 bg-[var(--ink)] flex flex-wrap items-center justify-between gap-3 text-xs">
-            <div className="space-y-0.5 min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-semibold text-[var(--bone)]">{u.name}</span>
-                <span className="font-mono-tabular text-[var(--muted)]">{u.email}</span>
-                <StatusLabel status={u.roleKey} tone={u.roleKey.startsWith('admin') ? 'gold' : 'cedar'} />
-                {u.isBlocked && <StatusLabel status="Blocked" tone="ember" />}
-              </div>
-              <p className="text-[11px] font-mono-tabular text-[var(--muted)]">
-                {u.phone} · 2FA: {u.totpEnabled ? 'On' : 'Off'}
-              </p>
-            </div>
+      <div className="max-h-96 overflow-y-auto divide-y divide-[var(--line)] border border-[var(--line)]">
+        {filtered.map((u) => {
+          const emailVerified = Boolean(u.emailVerifiedAt);
+          const phoneVerified = Boolean(u.phoneVerifiedAt);
+          const fullyVerified = Boolean(u.isFullyVerified ?? (emailVerified && phoneVerified));
+          const isBusy = busyUserId === u.id;
 
-            {u.id !== currentUserId && (
-              <button
-                type="button"
-                onClick={async () => {
-                  await apiFetch(`/api/admin/users/${u.id}/access`, {
-                    method: 'PATCH',
-                    body: JSON.stringify({ isBlocked: !u.isBlocked }),
-                  });
-                  showToast(u.isBlocked ? `Unblocked ${u.email}` : `Blocked ${u.email}`, 'info');
-                  await onReload();
-                }}
-                className={`inline-flex items-center gap-1 px-3 py-1.5 border font-mono-tabular uppercase cursor-pointer ${
-                  u.isBlocked
-                    ? 'border-[var(--cedar)] text-[var(--cedar)]'
-                    : 'border-[var(--ember)] text-[var(--ember)]'
-                }`}
-              >
-                <ShieldAlert className="w-3.5 h-3.5" />
-                <span>{u.isBlocked ? 'Unblock' : 'Block Account'}</span>
-              </button>
-            )}
-          </div>
-        ))}
+          return (
+            <div key={u.id} className="p-3 bg-[var(--ink)] flex flex-wrap items-center justify-between gap-3 text-xs">
+              <div className="space-y-1 min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-semibold text-[var(--bone)]">{u.name}</span>
+                  <span className="font-mono-tabular text-[var(--muted)]">{u.email}</span>
+                  <StatusLabel status={u.roleKey} tone={u.roleKey.startsWith('admin') ? 'gold' : 'cedar'} />
+                  {fullyVerified && <StatusLabel status="Fully Verified" tone="cedar" />}
+                  {u.isBlocked && <StatusLabel status="Blocked" tone="ember" />}
+                </div>
+                <p className="text-[11px] font-mono-tabular text-[var(--muted)] flex flex-wrap items-center gap-2">
+                  <span>{u.phone}</span>
+                  <span>·</span>
+                  <span className={emailVerified ? 'text-[var(--cedar)]' : 'text-[var(--gold)]'}>
+                    Email: {emailVerified ? 'Verified' : 'Unverified'}
+                  </span>
+                  <span>·</span>
+                  <span className={phoneVerified ? 'text-[var(--cedar)]' : 'text-[var(--gold)]'}>
+                    Phone: {phoneVerified ? 'Verified' : 'Unverified'}
+                  </span>
+                  <span>·</span>
+                  <span>2FA: {u.totpEnabled ? 'On' : 'Off'}</span>
+                </p>
+              </div>
+
+              {u.id !== currentUserId && (
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={isBusy}
+                    onClick={() =>
+                      void patchUserAccess(
+                        u,
+                        { verifyEmail: !emailVerified },
+                        `${!emailVerified ? 'Verified' : 'Unverified'} email for ${u.email}`
+                      )
+                    }
+                    className={`px-2.5 py-1.5 border font-mono-tabular uppercase cursor-pointer disabled:opacity-50 ${
+                      emailVerified
+                        ? 'border-[var(--cedar)] text-[var(--cedar)]'
+                        : 'border-[var(--line)] text-[var(--bone)] hover:border-[var(--cedar)]'
+                    }`}
+                  >
+                    {emailVerified ? 'Email ✓' : 'Verify Email'}
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isBusy}
+                    onClick={() =>
+                      void patchUserAccess(
+                        u,
+                        { verifyPhone: !phoneVerified },
+                        `${!phoneVerified ? 'Verified' : 'Unverified'} phone for ${u.email}`
+                      )
+                    }
+                    className={`px-2.5 py-1.5 border font-mono-tabular uppercase cursor-pointer disabled:opacity-50 ${
+                      phoneVerified
+                        ? 'border-[var(--cedar)] text-[var(--cedar)]'
+                        : 'border-[var(--line)] text-[var(--bone)] hover:border-[var(--cedar)]'
+                    }`}
+                  >
+                    {phoneVerified ? 'Phone ✓' : 'Verify Phone'}
+                  </button>
+
+                  {isSuperAdmin && u.roleKey !== 'admin_super' && (
+                    <select
+                      aria-label={`Role for ${u.email}`}
+                      disabled={isBusy}
+                      value={u.roleKey}
+                      onChange={(e) =>
+                        void patchUserAccess(
+                          u,
+                          { roleKey: e.target.value },
+                          `Updated role for ${u.email} to ${e.target.value}`
+                        )
+                      }
+                      className="bg-[var(--graphite)] border border-[var(--line)] px-2 py-1.5 font-mono-tabular text-[var(--bone)]"
+                    >
+                      <option value="customer">customer</option>
+                      <option value="seller_owner">seller_owner</option>
+                      <option value="seller_staff">seller_staff</option>
+                      <option value="admin_staff">admin_staff</option>
+                    </select>
+                  )}
+
+                  <button
+                    type="button"
+                    disabled={isBusy}
+                    onClick={() =>
+                      void patchUserAccess(
+                        u,
+                        { isBlocked: !u.isBlocked },
+                        u.isBlocked ? `Unblocked ${u.email}` : `Blocked ${u.email}`
+                      )
+                    }
+                    className={`inline-flex items-center gap-1 px-3 py-1.5 border font-mono-tabular uppercase cursor-pointer disabled:opacity-50 ${
+                      u.isBlocked
+                        ? 'border-[var(--cedar)] text-[var(--cedar)]'
+                        : 'border-[var(--ember)] text-[var(--ember)]'
+                    }`}
+                  >
+                    <ShieldAlert className="w-3.5 h-3.5" />
+                    <span>{u.isBlocked ? 'Unblock' : 'Block Account'}</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );

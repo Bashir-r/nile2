@@ -1,11 +1,13 @@
 import React, { useEffect, useState } from 'react';
-import { Clock, MapPin, MessageCircle, Truck } from 'lucide-react';
+import { Clock, MapPin, MessageCircle, MessageSquare, Truck } from 'lucide-react';
 import type { Product, Review, Seller } from '../shared/types.ts';
 import { APPROVED_STOREFRONT_THEMES } from '../shared/themes.ts';
+import { buildWhatsAppBusinessLink } from '../shared/communication.ts';
 import { useMarketplace } from '../context/MarketplaceContext.tsx';
 import { EmptyState, ProductCard, SectionHeading, StampBadge } from '../components/HairlineUI.tsx';
 import { OfferBannerStrip } from '../components/OfferBannerStrip.tsx';
 import { StoreLocationsMap } from '../components/maps/StoreLocationsMap.tsx';
+import { StoreChatModal } from '../components/StoreChatModal.tsx';
 import {
   buildBreadcrumbSchema,
   buildStoreSchema,
@@ -20,6 +22,7 @@ export function StorefrontPage({ slug }: { slug: string }) {
   const [products, setProducts] = useState<Product[]>([]);
   const [reviews, setReviews] = useState<Review[]>([]);
   const [loading, setLoading] = useState(true);
+  const [chatOpen, setChatOpen] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -99,9 +102,14 @@ export function StorefrontPage({ slug }: { slug: string }) {
 
   const themeSpec = APPROVED_STOREFRONT_THEMES[seller.storefrontTheme] || APPROVED_STOREFRONT_THEMES['obsidian-ember'];
   const accentHex = theme === 'dark' ? themeSpec.accentHexDark : themeSpec.accentHexLight;
-  const whatsappUrl = `https://wa.me/${seller.whatsappPhone}?text=${encodeURIComponent(
-    `Hello ${seller.name.en}, I am browsing your storefront on NileLink.`
-  )}`;
+  const commPrefs = seller.communicationPrefs;
+  const showWhatsApp = commPrefs ? commPrefs.whatsappEnabled : Boolean(seller.whatsappPhone);
+  const showSystemChat = commPrefs ? commPrefs.systemChatEnabled : true;
+  const whatsappUrl = buildWhatsAppBusinessLink({
+    phone: seller.whatsappPhone,
+    storeName: seller.name.en,
+    greeting: commPrefs?.whatsappGreeting,
+  });
 
   return (
     <div className="max-w-[1440px] mx-auto px-4 md:px-8 py-6 md:py-8 space-y-8">
@@ -130,11 +138,21 @@ export function StorefrontPage({ slug }: { slug: string }) {
         <div className="hairline-cell lg:col-span-7 p-6 md:p-10 flex flex-col justify-between gap-6">
           <div>
             <div className="flex flex-wrap items-center gap-3">
-              {seller.verified && <StampBadge label={t.verifiedSeller} tone="cedar" />}
-              <span className="text-xs font-mono-tabular text-[var(--muted)] uppercase">
-                ★ {seller.rating.toFixed(1)} · {seller.reviewCount}{' '}
-                {locale === 'ar' ? 'تقييم' : 'reviews'}
-              </span>
+              {seller.logoImage && (
+                <img
+                  src={seller.logoImage}
+                  alt={seller.name[locale]}
+                  referrerPolicy="no-referrer"
+                  className="w-14 h-14 object-cover border border-[var(--line)] bg-[var(--ink)]"
+                />
+              )}
+              <div className="flex flex-wrap items-center gap-3">
+                {seller.verified && <StampBadge label={t.verifiedSeller} tone="cedar" />}
+                <span className="text-xs font-mono-tabular text-[var(--muted)] uppercase">
+                  ★ {seller.rating.toFixed(1)} · {seller.reviewCount}{' '}
+                  {locale === 'ar' ? 'تقييم' : 'reviews'}
+                </span>
+              </div>
             </div>
 
             <h1 className="mt-4 font-display text-4xl md:text-5xl font-bold text-[var(--bone)]">
@@ -145,15 +163,20 @@ export function StorefrontPage({ slug }: { slug: string }) {
             <p className="mt-2 text-sm text-[var(--muted)] max-w-xl">{seller.about[locale]}</p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-6 pt-4 border-t border-[var(--line)] text-xs text-[var(--muted)]">
+          <div className="flex flex-wrap items-center gap-4 pt-4 border-t border-[var(--line)] text-xs text-[var(--muted)]">
             <span className="inline-flex items-center gap-1.5">
               <MapPin className="w-3.5 h-3.5" style={{ color: accentHex }} />
+              {seller.cityAddress ? `${seller.cityAddress} · ` : ''}
               {seller.governorate} · {seller.district}
               {seller.locations && seller.locations.length > 0 ? ` (${seller.locations.length} pins)` : ''}
             </span>
             <span className="inline-flex items-center gap-1.5">
               <Clock className="w-3.5 h-3.5" style={{ color: accentHex }} />
-              {locale === 'ar' ? `تجهيز خلال ${seller.processingHours || 24} ساعة` : `Ships within ${seller.processingHours || 24}h`}
+              {seller.workingHours?.hours
+                ? seller.workingHours.hours
+                : locale === 'ar'
+                  ? `تجهيز خلال ${seller.processingHours || 24} ساعة`
+                  : `Ships within ${seller.processingHours || 24}h`}
             </span>
             <span className="inline-flex items-center gap-1.5">
               <Truck className="w-3.5 h-3.5" style={{ color: accentHex }} />
@@ -165,15 +188,27 @@ export function StorefrontPage({ slug }: { slug: string }) {
                   ? 'توصيل نايل لينك'
                   : 'Platform Courier'}
             </span>
-            <a
-              href={whatsappUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="editorial-link font-semibold text-[var(--cedar)]"
-            >
-              <MessageCircle className="w-3.5 h-3.5" />
-              <span>{t.contactWhatsapp}</span>
-            </a>
+            {showSystemChat && (
+              <button
+                type="button"
+                onClick={() => setChatOpen(true)}
+                className="px-3 py-1.5 bg-[var(--ember)] text-[var(--ember-fg)] text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+              >
+                <MessageSquare className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>{locale === 'ar' ? 'محادثة المتجر' : 'System Chat'}</span>
+              </button>
+            )}
+            {showWhatsApp && whatsappUrl && (
+              <a
+                href={whatsappUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="px-3 py-1.5 border border-[var(--line)] text-xs font-semibold text-[var(--cedar)] hover:border-[var(--cedar)] inline-flex items-center gap-1.5"
+              >
+                <MessageCircle className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>{t.contactWhatsapp}</span>
+              </a>
+            )}
           </div>
           {seller.returnPolicy?.[locale] && (
             <p className="text-xs text-[var(--muted)] border-t border-[var(--line)] pt-3">
@@ -240,6 +275,7 @@ export function StorefrontPage({ slug }: { slug: string }) {
           </div>
         </section>
       )}
+      <StoreChatModal open={chatOpen} onClose={() => setChatOpen(false)} seller={seller} />
     </div>
   );
 }

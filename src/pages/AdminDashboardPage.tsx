@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Download, KeyRound, Lock, RefreshCw, ShieldCheck } from 'lucide-react';
+import { Download, KeyRound, Lock, RefreshCw, ShieldCheck, Upload } from 'lucide-react';
 import type {
+  AdminUserSummary,
   AuditLogEntry,
   AutomationFlow,
   Campaign,
@@ -42,13 +43,13 @@ import { EmptyState, PriceDisplay, SectionHeading, StatusLabel } from '../compon
 import { AdminHomeBuilderTab } from '../components/AdminHomeBuilderTab.tsx';
 import { AdminPromotionsTab } from '../components/AdminPromotionsTab.tsx';
 import { AdminSeoPanel } from '../components/admin/AdminSeoPanel.tsx';
+import { AdminUserManagement } from '../components/admin/AdminUserManagement.tsx';
+import { withAdminGuard } from '../components/guards/withAdminGuard.tsx';
 import {
   AdminCatalogModerationPanel,
   AdminCasesPanel,
   AdminDeliveryZonesEditor,
   AdminKycDocumentsPanel,
-  AdminUserAccessPanel,
-  type AdminUserSummary,
 } from '../components/admin/AdminOperationsPanels.tsx';
 
 interface AdminOverviewPayload {
@@ -121,8 +122,8 @@ const ALL_ADMIN_PERMS = [
   'users.manage',
 ];
 
-export function AdminDashboardPage() {
-  const { authUser, refreshAuth, apiFetch, showToast, refreshBootstrap, seoMetadata } = useMarketplace();
+function AdminDashboardPageView() {
+  const { authUser, refreshAuth, apiFetch, showToast, refreshBootstrap, seoMetadata, siteChrome } = useMarketplace();
 
   useSeoMetadata({
     entityType: 'page',
@@ -147,6 +148,7 @@ export function AdminDashboardPage() {
   const [overview, setOverview] = useState<AdminOverviewPayload | null>(null);
   const [tab, setTab] = useState<
     | 'sellers'
+    | 'users'
     | 'catalog'
     | 'orders'
     | 'cases'
@@ -173,6 +175,12 @@ export function AdminDashboardPage() {
   const [payoutRefs, setPayoutRefs] = useState<Record<string, string>>({});
   const [sellerCommDrafts, setSellerCommDrafts] = useState<Record<string, string>>({});
   const [pageDrafts, setPageDrafts] = useState<Record<string, { bodyEn: string; bodyAr: string }>>({});
+  const [brandLogoDraft, setBrandLogoDraft] = useState(siteChrome.brandLogoUrl || '');
+  const [uploadingPlatformLogo, setUploadingPlatformLogo] = useState(false);
+
+  useEffect(() => {
+    setBrandLogoDraft(siteChrome.brandLogoUrl || '');
+  }, [siteChrome.brandLogoUrl]);
 
   // Staff creator state
   const [staffName, setStaffName] = useState('');
@@ -464,6 +472,7 @@ export function AdminDashboardPage() {
       <div className="flex flex-wrap gap-2">
         {[
           { id: 'sellers' as const, label: `Sellers & KYC (${overview.sellers.length})` },
+          { id: 'users' as const, label: `Users & Activity (${overview.users?.length || 0})` },
           { id: 'catalog' as const, label: `Catalog & Reviews (${overview.products?.length || 0})` },
           { id: 'orders' as const, label: `Orders (${overview.orders.length})` },
           {
@@ -497,13 +506,13 @@ export function AdminDashboardPage() {
           },
           { id: 'pages' as const, label: `Legal & Pages (${overview.pages.length})` },
           { id: 'settings' as const, label: 'Rates & Zones' },
-          { id: 'security' as const, label: 'RBAC, Users & Logs' },
+          { id: 'security' as const, label: 'RBAC & Logs' },
         ].map((tItem) => (
           <button
             key={tItem.id}
             type="button"
             onClick={() => setTab(tItem.id)}
-            className={`px-4 py-2 text-xs font-semibold border cursor-pointer ${
+            className={`px-4 py-2 text-xs font-semibold border whitespace-nowrap cursor-pointer ${
               tab === tItem.id
                 ? 'border-[var(--ember)] bg-[var(--ember)] text-[var(--ember-fg)]'
                 : 'border-[var(--line)] text-[var(--bone)]'
@@ -513,6 +522,15 @@ export function AdminDashboardPage() {
           </button>
         ))}
       </div>
+
+      {tab === 'users' && (
+        <AdminUserManagement
+          users={overview.users || []}
+          currentUserId={authUser.id}
+          isSuperAdmin={authUser.roleKey === 'admin_super'}
+          onReload={loadOverview}
+        />
+      )}
 
       {tab === 'sellers' && (
         <div className="space-y-6">
@@ -978,6 +996,113 @@ export function AdminDashboardPage() {
           </form>
 
           <AdminDeliveryZonesEditor zones={overview.deliveryZones} onReload={loadOverview} />
+
+          <div className="hairline-cell lg:col-span-12 p-6 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="font-display text-xl font-bold text-[var(--bone)]">NileLink Platform Brand Logo</h2>
+                <p className="text-xs text-[var(--muted)]">
+                  Upload or set the live NileLink marketplace logo rendered across the Header, Footer, and Organization SEO Schema.
+                </p>
+              </div>
+              <label className="inline-flex items-center gap-1.5 px-3.5 py-2 border border-[var(--line)] text-xs font-semibold text-[var(--bone)] hover:border-[var(--ember)] cursor-pointer">
+                <Upload className="w-3.5 h-3.5" />
+                <span>{uploadingPlatformLogo ? 'Uploading...' : 'Upload Logo File'}</span>
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp"
+                  className="hidden"
+                  onChange={async (e) => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    setUploadingPlatformLogo(true);
+                    try {
+                      const dataUrl = await new Promise<string>((resolve, reject) => {
+                        const reader = new FileReader();
+                        reader.onload = () => resolve(String(reader.result || ''));
+                        reader.onerror = () => reject(new Error('Failed to read image.'));
+                        reader.readAsDataURL(file);
+                      });
+                      const res = await apiFetch<{ media: { publicUrl: string } }>('/api/uploads', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                          base64Data: dataUrl,
+                          mimeType: file.type,
+                          entityType: 'editorial_image',
+                        }),
+                      });
+                      setBrandLogoDraft(res.media.publicUrl);
+                      showToast('Platform logo uploaded — click Save & Publish Platform Logo to go live', 'info');
+                    } catch (err) {
+                      showToast((err as Error).message, 'error');
+                    } finally {
+                      setUploadingPlatformLogo(false);
+                    }
+                  }}
+                />
+              </label>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-4 text-xs">
+              {brandLogoDraft.trim() ? (
+                <div className="border border-[var(--line)] bg-[var(--ink)] px-4 py-2.5">
+                  <img
+                    src={brandLogoDraft.trim()}
+                    alt="NileLink Logo Preview"
+                    className="h-9 max-w-[180px] object-contain"
+                  />
+                </div>
+              ) : (
+                <div className="border border-dashed border-[var(--line)] px-4 py-2.5 font-mono-tabular text-[var(--muted)]">
+                  Default Cedar Mark Active
+                </div>
+              )}
+
+              <input
+                value={brandLogoDraft}
+                onChange={(e) => setBrandLogoDraft(e.target.value)}
+                placeholder="Logo image URL (/uploads/... or https://...)"
+                className="flex-1 min-w-[240px] bg-[var(--ink)] border border-[var(--line)] px-3 py-2 font-mono-tabular text-[var(--bone)]"
+              />
+
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    const trimmed = brandLogoDraft.trim();
+                    await apiFetch('/api/admin/home-builder/chrome', {
+                      method: 'PUT',
+                      body: JSON.stringify({
+                        chrome: { ...siteChrome, brandLogoUrl: trimmed },
+                        publishNow: true,
+                      }),
+                    });
+                    if (seoMetadata?.global) {
+                      await apiFetch('/api/admin/seo/global', {
+                        method: 'PUT',
+                        body: JSON.stringify({
+                          global: {
+                            ...seoMetadata.global,
+                            organizationJsonLd: {
+                              ...seoMetadata.global.organizationJsonLd,
+                              logoUrl: trimmed,
+                            },
+                          },
+                        }),
+                      });
+                    }
+                    showToast('NileLink platform logo published live', 'success');
+                    await Promise.all([loadOverview(), refreshBootstrap()]);
+                  } catch (err) {
+                    showToast((err as Error).message, 'error');
+                  }
+                }}
+                className="px-5 py-2.5 bg-[var(--ember)] text-[var(--ember-fg)] text-xs font-bold uppercase cursor-pointer"
+              >
+                Save &amp; Publish Platform Logo
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -1089,11 +1214,23 @@ export function AdminDashboardPage() {
             </div>
           </div>
 
-          <AdminUserAccessPanel
-            users={overview.users || []}
-            currentUserId={authUser.id}
-            onReload={loadOverview}
-          />
+          <div className="border border-[var(--line)] bg-[var(--graphite)] p-5 flex flex-wrap items-center justify-between gap-3">
+            <div className="space-y-1">
+              <p className="text-xs font-mono-tabular uppercase text-[var(--cyan)]">
+                Registered User Accounts &amp; Activity Forensics ({overview.users?.length || 0})
+              </p>
+              <p className="text-xs text-[var(--muted)]">
+                Filter accounts, verify email/phone, deactivate/reactivate access, and inspect detailed per-user activity logs.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setTab('users')}
+              className="px-4 py-2 bg-[var(--ember)] text-[var(--ember-fg)] text-xs font-bold uppercase whitespace-nowrap cursor-pointer"
+            >
+              Open User Management
+            </button>
+          </div>
 
           <div className="hairline-grid grid-cols-1 md:grid-cols-2">
             <div className="hairline-cell p-5 space-y-2">
@@ -1132,3 +1269,6 @@ export function AdminDashboardPage() {
     </div>
   );
 }
+
+export const AdminDashboardPage = withAdminGuard(AdminDashboardPageView);
+export default AdminDashboardPage;
